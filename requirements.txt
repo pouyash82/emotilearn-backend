@@ -19,3 +19,4 @@ librosa
 soundfile
 transformers
 aiofiles
+python-dotenv

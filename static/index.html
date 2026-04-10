@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Emotion Recognition System</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, sans-serif;
+    background: #0f0f1a;
+    color: #fff;
+    min-height: 100vh;
+  }
+  header {
+    padding: 20px 40px;
+    background: #1a1a2e;
+    border-bottom: 2px solid #7c3aed;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  header h1 { font-size: 22px; color: #a78bfa; }
+  header p  { font-size: 13px; color: #666; }
+  .container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    padding: 24px 40px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  .card {
+    background: #1a1a2e;
+    border-radius: 16px;
+    padding: 24px;
+    border: 1px solid #2d2d4e;
+  }
+  .card h2 {
+    font-size: 16px;
+    color: #a78bfa;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #webcam-container {
+    position: relative;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 4/3;
+  }
+  #webcam-feed {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  #webcam-overlay {
+    position: absolute;
+    top: 12px; left: 12px;
+    background: rgba(0,0,0,0.7);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  .emotion-badge {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 18px;
+    font-weight: 700;
+    margin: 8px 0;
+  }
+  .btn {
+    padding: 10px 24px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 0.2s;
+  }
+  .btn-primary { background: #7c3aed; color: white; }
+  .btn-primary:hover { background: #6d28d9; }
+  .btn-danger  { background: #dc2626; color: white; }
+  .btn-danger:hover  { background: #b91c1c; }
+  .btn-success { background: #059669; color: white; }
+  .btn-success:hover { background: #047857; }
+  .score-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+    font-size: 13px;
+  }
+  .score-bar-label { width: 80px; color: #aaa; }
+  .score-bar-track {
+    flex: 1;
+    height: 8px;
+    background: #2d2d4e;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .score-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s;
+  }
+  .score-bar-value {
+    width: 40px;
+    text-align: right;
+    color: #a78bfa;
+  }
+  #speech-result {
+    background: #0f0f1a;
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 12px;
+    font-size: 13px;
+    line-height: 1.8;
+  }
+  .status { font-size: 12px; color: #666; margin-top: 8px; }
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 6px;
+  }
+  .dot-green { background: #22c55e; animation: pulse 1s infinite; }
+  .dot-red   { background: #ef4444; }
+  .dot-gray  { background: #666; }
+  @keyframes pulse {
+    0%,100% { opacity:1; } 50% { opacity:0.3; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>🧠 Emotion Recognition System</h1>
+    <p>Real-time multimodal emotion detection</p>
+  </div>
+  <div style="margin-left:auto;display:flex;gap:12px;align-items:center">
+    <span id="api-status" class="status">
+      <span class="dot dot-gray"></span>Connecting...
+    </span>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Vision Card -->
+  <div class="card">
+    <h2>📷 Face Emotion</h2>
+    <div id="webcam-container">
+      <img id="webcam-feed" src="" alt="Webcam feed">
+      <div id="webcam-overlay">
+        <span id="face-count">No faces detected</span>
+      </div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="startWebcam()">
+        Start Webcam
+      </button>
+      <button class="btn btn-danger" onclick="stopWebcam()">
+        Stop
+      </button>
+    </div>
+    <div id="vision-result" style="margin-top:16px">
+      <div style="color:#666;font-size:13px">
+        Start webcam to see results
+      </div>
+    </div>
+  </div>
+
+  <!-- Speech Card -->
+  <div class="card">
+    <h2>🎙️ Speech Emotion</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="record-btn"
+              onclick="startRecording()">
+        Start Recording
+      </button>
+      <button class="btn btn-danger" id="stop-btn"
+              onclick="stopRecording()" disabled>
+        Stop & Analyze
+      </button>
+      <label class="btn btn-success" style="cursor:pointer">
+        Upload Audio
+        <input type="file" accept="audio/*"
+               style="display:none"
+               onchange="uploadAudio(this)">
+      </label>
+    </div>
+    <div id="recording-status" class="status" style="margin-top:8px">
+      Click "Start Recording" to begin
+    </div>
+    <div id="speech-result">
+      <div style="color:#666">
+        Record or upload audio to see results
+      </div>
+    </div>
+  </div>
+
+  <!-- Combined Result -->
+  <div class="card" style="grid-column:1/-1">
+    <h2>🔗 Combined Emotion Analysis</h2>
+    <div id="combined-result">
+      <div style="color:#666;font-size:13px">
+        Waiting for both vision and speech input...
+      </div>
+    </div>
+  </div>
+
+  <!-- Learning Profile Card -->
+  <div class="card" style="grid-column:1/-1">
+    <h2>📊 Learning Profile & Emotion Timeline</h2>
+    <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="startSession()">
+        Start Session
+      </button>
+      <button class="btn btn-danger" onclick="resetSession()">
+        Reset Session
+      </button>
+      <button class="btn btn-success" onclick="loadProfile()">
+        Refresh Profile
+      </button>
+    </div>
+    <div id="profile-content"
+         style="display:grid;grid-template-columns:1fr 2fr;gap:24px">
+      <div id="profile-stats"
+           style="background:#0f0f1a;border-radius:12px;
+                  padding:16px;font-size:13px">
+        <div style="color:#666">
+          Start a session to see the learning profile
+        </div>
+      </div>
+      <div>
+        <canvas id="timeline-chart" height="120"></canvas>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = 'http://localhost:8000';
+let ws            = null;
+let mediaRecorder = null;
+let audioChunks   = [];
+let lastVisionEmotion = null;
+let lastSpeechResult  = null;
+
+const EMOTION_COLORS = {
+  anger    : '#ef4444',
+  disgust  : '#a855f7',
+  fear     : '#f97316',
+  happiness: '#22c55e',
+  neutral  : '#6b7280',
+  sadness  : '#3b82f6',
+  surprise : '#eab308',
+};
+
+// ── API status check ───────────────────────────────────────────────────────
+async function checkAPI() {
+  try {
+    const r = await fetch(API + '/');
+    if (r.ok) {
+      document.getElementById('api-status').innerHTML =
+        '<span class="dot dot-green"></span>API Connected';
+    }
+  } catch {
+    document.getElementById('api-status').innerHTML =
+      '<span class="dot dot-red"></span>API Offline';
+    setTimeout(checkAPI, 3000);
+  }
+}
+checkAPI();
+
+// ── Webcam ─────────────────────────────────────────────────────────────────
+function startWebcam() {
+  if (ws) ws.close();
+  ws = new WebSocket('ws://localhost:8000/ws/webcam');
+
+  ws.onopen = () => {
+    document.getElementById('api-status').innerHTML =
+      '<span class="dot dot-green"></span>Webcam streaming';
+  };
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.error) { alert(data.error); return; }
+
+    document.getElementById('webcam-feed').src =
+      'data:image/jpeg;base64,' + data.frame;
+    document.getElementById('face-count').textContent =
+      data.count > 0
+        ? `${data.count} face${data.count>1?'s':''} detected`
+        : 'No faces detected';
+
+    if (data.faces && data.faces.length > 0) {
+      const face    = data.faces[0];
+      const emotion = face.emotion;
+      const color   = EMOTION_COLORS[emotion] || '#a78bfa';
+      lastVisionEmotion = face;
+
+      let scoresHTML = '';
+      const sorted = Object.entries(face.scores)
+            .sort((a,b)=>b[1]-a[1]);
+      for (const [e,s] of sorted) {
+        const c = EMOTION_COLORS[e] || '#a78bfa';
+        scoresHTML += `
+          <div class="score-bar">
+            <span class="score-bar-label">${e}</span>
+            <div class="score-bar-track">
+              <div class="score-bar-fill"
+                   style="width:${s*100}%;background:${c}">
+              </div>
+            </div>
+            <span class="score-bar-value">
+              ${(s*100).toFixed(0)}%
+            </span>
+          </div>`;
+      }
+
+      document.getElementById('vision-result').innerHTML = `
+        <div class="emotion-badge"
+             style="background:${color}20;color:${color};
+                    border:1px solid ${color}">
+          ${emotion.toUpperCase()}
+        </div>
+        ${scoresHTML}`;
+
+      updateCombined();
+    }
+  };
+
+  ws.onerror = () => {
+    document.getElementById('api-status').innerHTML =
+      '<span class="dot dot-red"></span>WebSocket error';
+  };
+}
+
+function stopWebcam() {
+  if (ws) { ws.close(); ws = null; }
+  document.getElementById('webcam-feed').src = '';
+  document.getElementById('face-count').textContent = '';
+  document.getElementById('api-status').innerHTML =
+    '<span class="dot dot-gray"></span>Webcam stopped';
+}
+
+// ── Audio ──────────────────────────────────────────────────────────────────
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(
+      {audio:true});
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks   = [];
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.start();
+    document.getElementById('record-btn').disabled = true;
+    document.getElementById('stop-btn').disabled   = false;
+    document.getElementById('recording-status').innerHTML =
+      '<span class="dot dot-green"></span>Recording...';
+  } catch(e) {
+    alert('Microphone error: ' + e.message);
+  }
+}
+
+async function stopRecording() {
+  if (!mediaRecorder) return;
+  mediaRecorder.stop();
+  mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  document.getElementById('record-btn').disabled = false;
+  document.getElementById('stop-btn').disabled   = true;
+  document.getElementById('recording-status').innerHTML =
+    '<span class="dot dot-gray"></span>Analyzing...';
+  mediaRecorder.onstop = async () => {
+    const blob = new Blob(audioChunks, {type:'audio/wav'});
+    await analyzeAudio(blob);
+  };
+}
+
+async function uploadAudio(input) {
+  const file = input.files[0];
+  if (!file) return;
+  document.getElementById('recording-status').textContent =
+    'Analyzing ' + file.name + '...';
+  await analyzeAudio(file);
+}
+
+async function analyzeAudio(blob) {
+  const form = new FormData();
+  form.append('file', blob, 'audio.wav');
+  try {
+    const r    = await fetch(API + '/predict/audio',
+                             {method:'POST', body:form});
+    const data = await r.json();
+    lastSpeechResult = data;
+    displaySpeechResult(data);
+    updateCombined();
+  } catch(e) {
+    document.getElementById('recording-status').textContent =
+      'Error: ' + e.message;
+  }
+}
+
+function displaySpeechResult(data) {
+  const emotion = data.final_emotion;
+  const color   = EMOTION_COLORS[emotion] || '#a78bfa';
+  let scoresHTML = '';
+  const sorted = Object.entries(data.fused_scores||{})
+        .sort((a,b)=>b[1]-a[1]);
+  for (const [e,s] of sorted) {
+    const c = EMOTION_COLORS[e] || '#a78bfa';
+    scoresHTML += `
+      <div class="score-bar">
+        <span class="score-bar-label">${e}</span>
+        <div class="score-bar-track">
+          <div class="score-bar-fill"
+               style="width:${s*100}%;background:${c}">
+          </div>
+        </div>
+        <span class="score-bar-value">
+          ${(s*100).toFixed(0)}%
+        </span>
+      </div>`;
+  }
+  document.getElementById('speech-result').innerHTML = `
+    <div style="margin-bottom:8px;color:#aaa;font-size:13px">
+      "${data.transcription || 'No transcription'}"
+    </div>
+    <div class="emotion-badge"
+         style="background:${color}20;color:${color};
+                border:1px solid ${color}">
+      ${emotion.toUpperCase()}
+    </div>
+    <div style="font-size:12px;color:#666;margin:4px 0 8px">
+      Text: ${data.text_emotion} |
+      Audio: ${data.audio_emotion}
+    </div>
+    ${scoresHTML}`;
+  document.getElementById('recording-status').innerHTML =
+    '<span class="dot dot-green"></span>Analysis complete';
+}
+
+// ── Combined ───────────────────────────────────────────────────────────────
+function updateCombined() {
+  if (!lastVisionEmotion && !lastSpeechResult) return;
+  let html =
+    '<div style="display:flex;gap:40px;align-items:start">';
+
+  if (lastVisionEmotion) {
+    const e = lastVisionEmotion.emotion;
+    const c = EMOTION_COLORS[e] || '#a78bfa';
+    html += `
+      <div>
+        <div style="color:#666;font-size:12px;margin-bottom:4px">
+          Face
+        </div>
+        <div class="emotion-badge"
+             style="background:${c}20;color:${c};
+                    border:1px solid ${c}">
+          ${e.toUpperCase()}
+        </div>
+      </div>`;
+  }
+
+  if (lastSpeechResult) {
+    const e = lastSpeechResult.final_emotion;
+    const c = EMOTION_COLORS[e] || '#a78bfa';
+    html += `
+      <div>
+        <div style="color:#666;font-size:12px;margin-bottom:4px">
+          Speech
+        </div>
+        <div class="emotion-badge"
+             style="background:${c}20;color:${c};
+                    border:1px solid ${c}">
+          ${e.toUpperCase()}
+        </div>
+      </div>`;
+  }
+
+  if (lastVisionEmotion && lastSpeechResult) {
+    const allE  = new Set([
+      ...Object.keys(lastVisionEmotion.scores),
+      ...Object.keys(lastSpeechResult.fused_scores||{}),
+    ]);
+    const fused = {};
+    for (const e of allE) {
+      const v = lastVisionEmotion.scores[e]||0;
+      const s = (lastSpeechResult.fused_scores||{})[e]||0;
+      fused[e] = +(0.5*v + 0.5*s).toFixed(4);
+    }
+    const final = Object.entries(fused)
+          .sort((a,b)=>b[1]-a[1])[0][0];
+    const c = EMOTION_COLORS[final] || '#a78bfa';
+    html += `
+      <div style="margin-left:auto">
+        <div style="color:#666;font-size:12px;margin-bottom:4px">
+          Combined (50/50)
+        </div>
+        <div class="emotion-badge"
+             style="background:${c}20;color:${c};
+                    border:2px solid ${c};font-size:22px">
+          ${final.toUpperCase()}
+        </div>
+      </div>`;
+  }
+
+  html += '</div>';
+  document.getElementById('combined-result').innerHTML = html;
+}
+
+// ── Learning Profile ───────────────────────────────────────────────────────
+async function startSession() {
+  await fetch(API + '/session/start', {method:'POST'});
+  document.getElementById('profile-stats').innerHTML =
+    '<div style="color:#22c55e">✅ Session started — detecting emotions...</div>';
+  if (window.profileInterval) clearInterval(window.profileInterval);
+  window.profileInterval = setInterval(loadProfile, 5000);
+}
+
+async function resetSession() {
+  await fetch(API + '/session/reset', {method:'POST'});
+  document.getElementById('profile-stats').innerHTML =
+    '<div style="color:#666">Session reset</div>';
+  if (window.profileInterval) clearInterval(window.profileInterval);
+  if (window.timelineChart) {
+    window.timelineChart.destroy();
+    window.timelineChart = null;
+  }
+}
+
+async function loadProfile() {
+  try {
+    const r    = await fetch(API + '/session/profile');
+    const data = await r.json();
+    if (data.error) return;
+    displayProfile(data);
+  } catch(e) {
+    console.error('Profile error:', e);
+  }
+}
+
+function displayProfile(data) {
+  const dominant = data.dominant_emotion;
+  const color    = EMOTION_COLORS[dominant] || '#a78bfa';
+  let distHTML   = '';
+  const sorted   = Object.entries(data.distribution||{})
+        .sort((a,b)=>b[1]-a[1]);
+  for (const [e,pct] of sorted) {
+    const c = EMOTION_COLORS[e] || '#a78bfa';
+    distHTML += `
+      <div class="score-bar">
+        <span class="score-bar-label">${e}</span>
+        <div class="score-bar-track">
+          <div class="score-bar-fill"
+               style="width:${pct}%;background:${c}">
+          </div>
+        </div>
+        <span class="score-bar-value">${pct}%</span>
+      </div>`;
+  }
+  const engColor = data.avg_engagement>=70 ? '#22c55e'
+                 : data.avg_engagement>=40 ? '#eab308'
+                 : '#ef4444';
+  document.getElementById('profile-stats').innerHTML = `
+    <div style="margin-bottom:12px">
+      <div style="color:#666;font-size:11px">
+        Dominant Emotion
+      </div>
+      <div class="emotion-badge"
+           style="background:${color}20;color:${color};
+                  border:1px solid ${color}">
+        ${dominant.toUpperCase()}
+      </div>
+    </div>
+    <div style="margin-bottom:12px">
+      <div style="color:#666;font-size:11px">
+        Engagement Level
+      </div>
+      <div style="font-size:20px;font-weight:700;color:${engColor}">
+        ${data.engagement_label}
+        <span style="font-size:13px;font-weight:400">
+          (${data.avg_engagement}%)
+        </span>
+      </div>
+    </div>
+    <div style="color:#666;font-size:11px;margin-bottom:8px">
+      Total detections: ${data.total_detections}
+    </div>
+    <div>
+      <div style="color:#666;font-size:11px;margin-bottom:4px">
+        Emotion Distribution
+      </div>
+      ${distHTML}
+    </div>`;
+
+  drawTimeline(data.timeline, data.engagement_trend);
+}
+
+function drawTimeline(timeline, engagement) {
+  const canvas = document.getElementById('timeline-chart');
+  const ctx    = canvas.getContext('2d');
+  if (window.timelineChart) {
+    window.timelineChart.destroy();
+  }
+  const labels   = engagement.map((_,i) => i);
+  const engData  = engagement.map(e => e.score*100);
+  const ptColors = timeline.map(
+    e => EMOTION_COLORS[e.emotion]||'#a78bfa');
+
+  window.timelineChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label          : 'Engagement %',
+        data           : engData,
+        borderColor    : '#7c3aed',
+        backgroundColor: 'rgba(124,58,237,0.1)',
+        fill           : true,
+        tension        : 0.4,
+        pointRadius    : 3,
+        pointBackgroundColor: ptColors,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: {
+          labels: {color:'#aaa', font:{size:11}}
+        },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const idx = ctx.dataIndex;
+              if (timeline[idx]) {
+                return `Emotion: ${timeline[idx].emotion}`;
+              }
+            }
+          }
+        }
+      },
+      scales: {
+        x: { display: false },
+        y: {
+          min  : 0,
+          max  : 100,
+          ticks: {color:'#666', font:{size:10}},
+          grid : {color:'#2d2d4e'},
+        }
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>

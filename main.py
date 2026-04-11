@@ -9,7 +9,7 @@ import soundfile as sf
 from pathlib import Path
 from collections import deque
 from datetime import datetime
-from fastapi import FastAPI, File, UploadFile, WebSocket
+from fastapi import FastAPI, File, UploadFile, WebSocket, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -17,9 +17,11 @@ from transformers import pipeline
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from pydantic import BaseModel
+from typing import Optional
 
 # ── Config ─────────────────────────────────────────────────────────────────
-DEVICE     = torch.device("mps" if torch.backends.mps.is_available()
+DEVICE     = torch.device("cuda" if torch.cuda.is_available()
+                          else "mps" if torch.backends.mps.is_available()
                           else "cpu")
 MODEL_PATH = Path(__file__).parent / "models" / \
              "efficientnet_b2_finetuned_best.pth"
@@ -143,9 +145,9 @@ async def startup():
     await init_db()
 
 # ── Static files ───────────────────────────────────────────────────────────
-app.mount("/static", StaticFiles(
-    directory=str(Path(__file__).parent / "static")),
-    name="static")
+static_path = Path(__file__).parent / "static"
+if static_path.exists():
+    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,26 +190,36 @@ val_transform = A.Compose([
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-# ── STT model ──────────────────────────────────────────────────────────────
+# ── STT model (lazy load) ──────────────────────────────────────────────────
 stt_model = None
-try:
-    print("Loading Whisper...")
-    stt_model = whisper.load_model("base")
-    print("✅ Whisper loaded")
-except Exception as e:
-    print(f"⚠️  Whisper failed: {e}")
 
-# ── NLP model ──────────────────────────────────────────────────────────────
+def get_stt_model():
+    global stt_model
+    if stt_model is None:
+        try:
+            print("Loading Whisper...")
+            stt_model = whisper.load_model("base")
+            print("✅ Whisper loaded")
+        except Exception as e:
+            print(f"⚠️  Whisper failed: {e}")
+    return stt_model
+
+# ── NLP model (lazy load) ──────────────────────────────────────────────────
 nlp_pipeline = None
-try:
-    print("Loading NLP model...")
-    nlp_pipeline = pipeline(
-        "text-classification",
-        model="j-hartmann/emotion-english-distilroberta-base",
-        top_k=None, device=-1)
-    print("✅ NLP model loaded")
-except Exception as e:
-    print(f"⚠️  NLP model failed: {e}")
+
+def get_nlp_pipeline():
+    global nlp_pipeline
+    if nlp_pipeline is None:
+        try:
+            print("Loading NLP model...")
+            nlp_pipeline = pipeline(
+                "text-classification",
+                model="j-hartmann/emotion-english-distilroberta-base",
+                top_k=None, device=-1)
+            print("✅ NLP model loaded")
+        except Exception as e:
+            print(f"⚠️  NLP model failed: {e}")
+    return nlp_pipeline
 
 TEXT_TO_VISION = {
     "anger"   : "anger",   "disgust" : "disgust",
@@ -219,7 +231,7 @@ TEXT_TO_VISION = {
 # ── Helper functions ───────────────────────────────────────────────────────
 def predict_face_emotion(frame_bgr):
     if vision_model is None:
-        return "neutral", {e: 1/7 for e in CLASS_NAMES}
+        raise HTTPException(status_code=500, detail="Vision model not loaded")
     try:
         img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         aug = val_transform(image=img)["image"]
@@ -233,7 +245,7 @@ def predict_face_emotion(frame_bgr):
         return emotion, scores
     except Exception as e:
         print(f"Prediction error: {e}")
-        return "neutral", {e: 1/7 for e in CLASS_NAMES}
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
 def detect_and_predict(frame_bgr):
     try:
@@ -280,8 +292,9 @@ def audio_to_emotion(audio_path):
         "audio_scores" : {},
     }
     try:
-        if stt_model:
-            result = stt_model.transcribe(audio_path, language="en")
+        stt = get_stt_model()
+        if stt:
+            result = stt.transcribe(audio_path, language="en")
             text   = result["text"].strip()
         else:
             text = ""
@@ -289,8 +302,9 @@ def audio_to_emotion(audio_path):
 
         text_scores  = {}
         text_emotion = "neutral"
-        if nlp_pipeline and text and len(text) > 3:
-            nlp_out = nlp_pipeline(text)[0]
+        nlp = get_nlp_pipeline()
+        if nlp and text and len(text) > 3:
+            nlp_out = nlp(text)[0]
             for item in nlp_out:
                 mapped = TEXT_TO_VISION.get(
                     item["label"].lower(), item["label"].lower())
@@ -355,33 +369,18 @@ def audio_to_emotion(audio_path):
         print(f"Audio analysis error: {e}")
     return result_data
 
-# ── Request Models ─────────────────────────────────────────────────────────
-class EmotionRequest(BaseModel):
-    image: str  # base64 encoded image
-
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "status"   : "Emotion Recognition API running",
-        "endpoints": [
-            "GET  /dashboard",
-            "POST /predict/image",
-            "POST /predict/audio",
-            "POST /predict/combined",
-            "POST /api/detect-emotion",
-            "POST /session/start",
-            "POST /session/reset",
-            "GET  /session/profile",
-            "GET  /session/timeline",
-            "GET  /session/export/csv",
-            "GET  /session/export/report",
-            "POST /auth/register",
-            "POST /auth/login",
-            "GET  /auth/me",
-            "WS   /ws/webcam",
-        ]
+        "device"   : str(DEVICE),
+        "model_loaded": vision_model is not None,
     }
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": vision_model is not None}
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -392,77 +391,88 @@ async def dashboard():
         return HTMLResponse(
             content=f"<h1>Error: {e}</h1>", status_code=500)
 
-# ── NEW: API endpoint for React frontend ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# FIXED: Accepts FILE UPLOAD from React frontend (multipart/form-data)
+# ══════════════════════════════════════════════════════════════════════════
 @app.post("/api/detect-emotion")
-async def detect_emotion_api(request: EmotionRequest):
+async def detect_emotion_api(file: UploadFile = File(...)):
     """
-    Accepts base64 encoded image from React frontend,
-    returns emotion predictions.
+    Accepts image file upload from React frontend,
+    returns REAL emotion predictions from the EfficientNet model.
     """
-    try:
-        # Remove data URL prefix if present
-        base64_string = request.image
-        if ',' in base64_string:
-            base64_string = base64_string.split(',')[1]
-        
-        # Decode base64 to image
-        img_bytes = base64.b64decode(base64_string)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return {
-                "success": False,
-                "message": "Invalid image",
-                "emotions": {e: 0.0 for e in CLASS_NAMES},
-                "dominant": "neutral"
-            }
-        
-        # Detect faces and predict emotions
-        _, results = detect_and_predict(frame)
-        
-        if not results:
-            return {
-                "success": False,
-                "message": "No face detected",
-                "emotions": {e: 0.0 for e in CLASS_NAMES},
-                "dominant": "neutral"
-            }
-        
-        # Get the first face result (largest face)
-        face_result = results[0]
-        emotion = face_result["emotion"]
-        scores = face_result["scores"]
-        
-        # Log emotion for session tracking
-        log_emotion(emotion, scores, source="vision")
-        
-        # Calculate current engagement
-        current_eng = 0.0
-        if session_data["engagement"]:
-            current_eng = session_data["engagement"][-1]["score"]
-        
-        # Convert scores to percentages
-        emotions_pct = {k: round(v * 100, 1) for k, v in scores.items()}
-        
-        return {
-            "success": True,
-            "emotions": emotions_pct,
-            "dominant": emotion,
-            "confidence": round(scores.get(emotion, 0) * 100, 1),
-            "engagement": round(current_eng * 100, 1),
-            "bbox": face_result.get("bbox")
-        }
-        
-    except Exception as e:
-        print(f"Error in detect_emotion_api: {e}")
-        return {
-            "success": False,
-            "message": str(e),
-            "emotions": {e: 0.0 for e in CLASS_NAMES},
-            "dominant": "neutral"
-        }
+    if vision_model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    
+    # Read file bytes
+    contents = await file.read()
+    
+    # Decode image from bytes
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image format")
+    
+    # Detect faces and predict emotions using REAL model
+    _, results = detect_and_predict(frame)
+    
+    if not results:
+        raise HTTPException(status_code=400, detail="No face detected in image")
+    
+    # Get the first/largest face result
+    face_result = results[0]
+    emotion = face_result["emotion"]
+    scores = face_result["scores"]
+    
+    # Log emotion for session tracking
+    log_emotion(emotion, scores, source="vision")
+    
+    # Calculate current engagement
+    current_eng = 0.0
+    if session_data["engagement"]:
+        current_eng = session_data["engagement"][-1]["score"]
+    
+    # Convert scores to percentages for frontend
+    emotions_pct = {k: round(v * 100, 1) for k, v in scores.items()}
+    
+    return {
+        "success": True,
+        "dominant": emotion,
+        "confidence": round(scores.get(emotion, 0) * 100, 1),
+        "emotions": emotions_pct,
+        "engagement": round(current_eng * 100, 1),
+        "bbox": face_result.get("bbox")
+    }
 
+# ── Session endpoints ──────────────────────────────────────────────────────
+@app.post("/session/start")
+async def session_start():
+    reset_session()
+    return {"status": "Session started", "time": session_data["start_time"]}
+
+@app.post("/session/reset")
+async def session_reset():
+    reset_session()
+    return {"status": "Session reset", "time": session_data["start_time"]}
+
+@app.post("/session/end")
+async def session_end():
+    """End session and return summary"""
+    profile = get_learning_profile()
+    return {"status": "Session ended", "profile": profile}
+
+@app.get("/session/profile")
+async def session_profile():
+    return get_learning_profile()
+
+@app.get("/session/timeline")
+async def session_timeline():
+    return {
+        "emotions"  : session_data["emotions"][-100:],
+        "engagement": session_data["engagement"][-100:],
+    }
+
+# ── Predict endpoints ──────────────────────────────────────────────────────
 @app.post("/predict/image")
 async def predict_image(file: UploadFile = File(...)):
     try:
@@ -470,12 +480,13 @@ async def predict_image(file: UploadFile = File(...)):
         arr   = np.frombuffer(data, np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
-            return {"error": "Invalid image",
-                    "faces": [], "count": 0}
+            return {"error": "Invalid image"}
         _, results = detect_and_predict(frame)
+        for r in results:
+            log_emotion(r["emotion"], r["scores"], source="vision")
         return {"faces": results, "count": len(results)}
     except Exception as e:
-        return {"error": str(e), "faces": [], "count": 0}
+        return {"error": str(e)}
 
 @app.post("/predict/audio")
 async def predict_audio(file: UploadFile = File(...)):
@@ -484,86 +495,68 @@ async def predict_audio(file: UploadFile = File(...)):
         data = await file.read()
         with open(tmp_path, "wb") as f:
             f.write(data)
-        return audio_to_emotion(tmp_path)
+        result = audio_to_emotion(tmp_path)
+        if result.get("final_emotion"):
+            log_emotion(result["final_emotion"],
+                       result.get("fused_scores", {}),
+                       source="audio")
+        return result
     except Exception as e:
-        return {"error": str(e), "final_emotion": "neutral",
-                "transcription": ""}
+        return {"error": str(e)}
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 @app.post("/predict/combined")
 async def predict_combined(
-        image: UploadFile = File(...),
-        audio: UploadFile = File(...)):
-    try:
-        img_data = await image.read()
-        arr      = np.frombuffer(img_data, np.uint8)
-        frame    = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        _, face_results = detect_and_predict(frame)
-    except Exception:
-        face_results = []
-
+    image: UploadFile = File(...),
+    audio: UploadFile = File(...)
+):
+    img_data = await image.read()
+    aud_data = await audio.read()
+    arr   = np.frombuffer(img_data, np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    vision_results = []
+    if frame is not None:
+        _, vision_results = detect_and_predict(frame)
     tmp_path = f"/tmp/audio_{int(time.time())}.wav"
+    audio_result = {}
     try:
-        audio_data = await audio.read()
         with open(tmp_path, "wb") as f:
-            f.write(audio_data)
-        speech_result = audio_to_emotion(tmp_path)
-    except Exception:
-        speech_result = {"final_emotion": "neutral",
-                         "fused_scores": {}}
+            f.write(aud_data)
+        audio_result = audio_to_emotion(tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-
-    vision_emotion = (face_results[0]["emotion"]
-                      if face_results else "neutral")
-    if vision_emotion == speech_result["final_emotion"]:
-        combined   = vision_emotion
-        confidence = 0.9
-    else:
-        combined_scores = {}
-        for e in CLASS_NAMES:
-            v = face_results[0]["scores"].get(e, 0) \
-                if face_results else 0
-            s = speech_result.get("fused_scores", {}).get(e, 0)
-            combined_scores[e] = round(0.5 * v + 0.5 * s, 4)
-        combined   = max(combined_scores, key=combined_scores.get)
-        confidence = combined_scores[combined]
+    vision_top = vision_results[0] if vision_results else None
+    final_emotion = "neutral"
+    final_scores  = {}
+    if vision_top and audio_result.get("fused_scores"):
+        vs = vision_top["scores"]
+        aus = audio_result["fused_scores"]
+        all_e = set(vs) | set(aus)
+        for e in all_e:
+            final_scores[e] = round(
+                0.6 * vs.get(e, 0) +
+                0.4 * aus.get(e, 0), 4)
+        if final_scores:
+            final_emotion = max(final_scores, key=final_scores.get)
+    elif vision_top:
+        final_emotion = vision_top["emotion"]
+        final_scores  = vision_top["scores"]
+    elif audio_result.get("final_emotion"):
+        final_emotion = audio_result["final_emotion"]
+        final_scores  = audio_result.get("fused_scores", {})
+    if final_scores:
+        log_emotion(final_emotion, final_scores, source="combined")
     return {
-        "vision"  : {"emotion": vision_emotion,
-                     "faces"  : face_results},
-        "speech"  : speech_result,
-        "combined": {"emotion"   : combined,
-                     "confidence": confidence},
+        "vision"       : vision_results,
+        "audio"        : audio_result,
+        "final_emotion": final_emotion,
+        "final_scores" : final_scores,
     }
 
-@app.post("/session/start")
-async def start_session():
-    reset_session()
-    return {"status": "Session started",
-            "time"  : session_data["start_time"]}
-
-@app.post("/session/reset")
-async def reset_session_route():
-    reset_session()
-    return {"status": "Session reset"}
-
-@app.get("/session/profile")
-async def get_profile():
-    try:
-        return get_learning_profile()
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/session/timeline")
-async def get_timeline():
-    return {
-        "timeline"        : session_data["emotions"][-100:],
-        "engagement_trend": session_data["engagement"][-100:],
-    }
-
+# ── Export endpoints ───────────────────────────────────────────────────────
 @app.get("/session/export/csv")
 async def export_csv():
     if not session_data["emotions"]:
@@ -721,8 +714,8 @@ async def export_report():
     {timeline_rows}
   </table>
   <div class="footer">
-    Generated by Emotion Recognition System |
-    EfficientNet-B2 + Whisper + RoBERTa
+    Generated by EmotiLearn |
+    EfficientNet-B2 Vision Model
   </div>
 </body>
 </html>"""

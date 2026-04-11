@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 .env
-models/*.pth
 venv/
 .DS_Store

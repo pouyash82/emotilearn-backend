@@ -1106,3 +1106,287 @@ async def export_multi_report():
 # ══════════════════════════════════════════════════════════════════════════
 # END MULTI-FACE EXTENSION
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# MULTIMODAL EXTENSION — Whisper (speech→text) + RoBERTa (text→emotion)
+# Calls Hugging Face Serverless Inference API — no local model loading.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+import requests as _requests   # avoid shadowing any existing `requests`
+
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+_HF_HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+}
+
+_WHISPER_URL  = ("https://router.huggingface.co/hf-inference/"
+                 "models/openai/whisper-large-v3")
+
+_ROBERTA_URL  = ("https://router.huggingface.co/hf-inference/"
+                 "models/j-hartmann/emotion-english-distilroberta-base")
+
+# RoBERTa label → our 7-class label mapping
+# j-hartmann model outputs: anger, disgust, fear, joy, neutral, sadness, surprise
+_ROBERTA_LABEL_MAP = {
+    "anger"   : "anger",
+    "disgust" : "disgust",
+    "fear"    : "fear",
+    "joy"     : "happiness",   # map "joy" → "happiness"
+    "neutral" : "neutral",
+    "sadness" : "sadness",
+    "surprise": "surprise",
+}
+
+
+def _call_whisper(audio_bytes: bytes) -> dict:
+    """Send raw audio bytes to HF Whisper and return transcription."""
+    try:
+        resp = _requests.post(
+            _WHISPER_URL,
+            headers=_HF_HEADERS,
+            data=audio_bytes,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data.get("text", "")
+            return {"success": True, "text": text.strip()}
+        else:
+            return {"success": False,
+                    "error": f"Whisper API {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _call_roberta(text: str) -> dict:
+    """Send text to HF RoBERTa emotion classifier and return scores."""
+    try:
+        resp = _requests.post(
+            _ROBERTA_URL,
+            headers={**_HF_HEADERS,
+                     "Content-Type": "application/json"},
+            json={"inputs": text},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response shape: [[{"label":"joy","score":0.92}, ...]]
+            raw_scores = data[0] if isinstance(data, list) and data else data
+            if isinstance(raw_scores, list):
+                # Map to our label scheme
+                mapped = {}
+                for item in raw_scores:
+                    label = item.get("label", "").lower()
+                    our_label = _ROBERTA_LABEL_MAP.get(label, label)
+                    mapped[our_label] = round(item.get("score", 0), 4)
+                dominant = max(mapped, key=mapped.get) if mapped else "neutral"
+                return {
+                    "success" : True,
+                    "emotion" : dominant,
+                    "scores"  : mapped,
+                    "confidence": round(mapped.get(dominant, 0), 4),
+                }
+            return {"success": False, "error": "Unexpected response format"}
+        else:
+            return {"success": False,
+                    "error": f"RoBERTa API {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _fuse_scores(face_scores: dict, text_scores: dict,
+                 face_weight: float = 0.6,
+                 text_weight: float = 0.4) -> dict:
+    """
+    Weighted fusion of facial and text emotion scores.
+    Both dicts map emotion_name → probability (0-1).
+    Returns fused scores + dominant + engagement.
+    """
+    all_emotions = set(list(face_scores.keys()) +
+                       list(text_scores.keys()))
+    fused = {}
+    for emo in all_emotions:
+        f = face_scores.get(emo, 0)
+        t = text_scores.get(emo, 0)
+        fused[emo] = round(f * face_weight + t * text_weight, 4)
+
+    # Normalise so they sum to ~1
+    total = sum(fused.values())
+    if total > 0:
+        fused = {e: round(v / total, 4) for e, v in fused.items()}
+
+    dominant   = max(fused, key=fused.get) if fused else "neutral"
+    confidence = fused.get(dominant, 0)
+
+    # Compute engagement on fused result
+    base_map = {
+        "happiness": 0.85, "surprise": 0.80,
+        "anger"    : 0.65, "fear"    : 0.55,
+        "disgust"  : 0.50, "sadness" : 0.35,
+        "neutral"  : 0.30,
+    }
+    eng = base_map.get(dominant, 0.5)
+    eng += max(-0.1, min(0.15, (confidence - 0.5) * 0.3))
+    eng = max(0.05, min(1.0, eng))
+
+    return {
+        "dominant"  : dominant,
+        "scores"    : fused,
+        "confidence": round(confidence, 4),
+        "engagement": round(eng * 100, 1),
+    }
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """
+    Send an audio file (wav, mp3, flac, webm, ogg) → get text back.
+    Uses OpenAI Whisper large-v3 via Hugging Face Inference API.
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"success": False, "error": "Empty audio file"}
+
+    result = _call_whisper(audio_bytes)
+    return result
+
+
+@app.post("/api/text-emotion")
+async def text_emotion(payload: dict):
+    """
+    Send {"text": "..."} → get text-based emotion prediction back.
+    Uses j-hartmann/emotion-english-distilroberta-base via HF API.
+    """
+    text = payload.get("text", "").strip()
+    if not text:
+        return {"success": False, "error": "No text provided"}
+
+    result = _call_roberta(text)
+    return result
+
+
+@app.post("/api/multimodal-detect")
+async def multimodal_detect(
+    image: UploadFile = File(...),
+    audio: UploadFile = File(None),
+):
+    """
+    Multimodal emotion detection:
+      - Always runs facial emotion on the image (EfficientNet-B2, local)
+      - If audio is provided, runs Whisper → RoBERTa → fuses with face
+      - Returns face result, text result (if any), and fused result
+
+    Frontend sends both a webcam frame and an audio clip.
+    """
+    # ── 1. Facial emotion (local, always runs) ─────────────────────────
+    img_bytes = await image.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    face_result = {"success": False, "message": "No face detected"}
+    if frame is not None:
+        try:
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1,
+                minNeighbors=5, minSize=(48, 48))
+            if len(faces) > 0:
+                x, y, w, h = faces[0]
+                crop = frame[y:y+h, x:x+w]
+                emotion, scores = predict_face_emotion(crop)
+                face_result = {
+                    "success"   : True,
+                    "emotion"   : emotion,
+                    "scores"    : scores,
+                    "confidence": round(scores.get(emotion, 0), 4),
+                }
+        except Exception as e:
+            face_result = {"success": False, "error": str(e)}
+
+    # ── 2. Audio → text → text emotion (HF API, only if audio sent) ────
+    text_result  = None
+    whisper_text = ""
+    if audio is not None:
+        audio_bytes = await audio.read()
+        if audio_bytes and len(audio_bytes) > 100:
+            whisper = _call_whisper(audio_bytes)
+            if whisper.get("success"):
+                whisper_text = whisper["text"]
+                if whisper_text:
+                    text_result = _call_roberta(whisper_text)
+
+    # ── 3. Fusion ──────────────────────────────────────────────────────
+    fused = None
+    if face_result.get("success") and text_result and text_result.get("success"):
+        # Convert face scores (0-100) to 0-1 for fusion
+        face_01 = {k: v / 100 if v > 1 else v
+                   for k, v in face_result["scores"].items()}
+        fused = _fuse_scores(face_01, text_result["scores"])
+    elif face_result.get("success"):
+        # No audio or text failed — just return face as the result
+        fused = {
+            "dominant"  : face_result["emotion"],
+            "scores"    : face_result["scores"],
+            "confidence": face_result["confidence"],
+            "engagement": 0,  # will be computed by existing engagement fn
+        }
+
+    return {
+        "success"       : face_result.get("success", False),
+        "face"          : face_result,
+        "transcription" : whisper_text or None,
+        "text_emotion"  : text_result,
+        "fused"         : fused,
+        "modalities_used": {
+            "face" : face_result.get("success", False),
+            "audio": text_result is not None and
+                     text_result.get("success", False),
+        },
+    }
+
+
+@app.get("/api/multimodal/status")
+async def multimodal_status():
+    """Health check for the multimodal pipeline."""
+    hf_configured = bool(HF_TOKEN)
+
+    # Quick test: ping Whisper with empty request to check auth
+    whisper_ok = False
+    roberta_ok = False
+    if hf_configured:
+        try:
+            r = _requests.post(_WHISPER_URL, headers=_HF_HEADERS,
+                               data=b"", timeout=5)
+            # 400 = "bad audio" which means auth works
+            # 401/403 = bad token
+            whisper_ok = r.status_code in (200, 400, 422)
+        except Exception:
+            pass
+        try:
+            r = _requests.post(
+                _ROBERTA_URL,
+                headers={**_HF_HEADERS,
+                         "Content-Type": "application/json"},
+                json={"inputs": "test"},
+                timeout=5)
+            roberta_ok = r.status_code == 200
+        except Exception:
+            pass
+
+    return {
+        "hf_token_configured": hf_configured,
+        "whisper_available"  : whisper_ok,
+        "roberta_available"  : roberta_ok,
+        "whisper_model"      : "openai/whisper-large-v3",
+        "roberta_model"      : "j-hartmann/emotion-english-distilroberta-base",
+        "fusion_weights"     : {"face": 0.6, "text": 0.4},
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END MULTIMODAL EXTENSION
+# ══════════════════════════════════════════════════════════════════════════

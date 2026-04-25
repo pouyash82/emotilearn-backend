@@ -24,3 +24,4 @@ httpx
 ffmpeg-python
 numba
 scipy
+requests

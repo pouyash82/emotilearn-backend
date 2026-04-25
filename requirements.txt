@@ -25,3 +25,4 @@ ffmpeg-python
 numba
 scipy
 requests
+loguru

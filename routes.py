@@ -367,7 +367,8 @@ async def save_session(
             session_id      = session.id,
             timestamp       = datetime.fromisoformat(
                 log.get("time",
-                        datetime.utcnow().isoformat())),
+                        datetime.utcnow().isoformat()
+                ).replace("Z", "+00:00")).replace(tzinfo=None),
             emotion         = log.get("emotion", "neutral"),
             confidence      = log.get("confidence", 0.0),
             source          = log.get("source", "vision"),

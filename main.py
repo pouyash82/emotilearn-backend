@@ -1398,3 +1398,228 @@ async def multimodal_status():
 # ══════════════════════════════════════════════════════════════════════════
 # END MULTIMODAL EXTENSION
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# VOICE EMOTION EXTENSION — wav2vec2 (audio → emotion from tone/pitch)
+# Calls HF Serverless Inference API — no local model loading.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+_VOICE_EMOTION_URL = ("https://router.huggingface.co/hf-inference/"
+                      "models/r-f/wav2vec-english-speech-emotion-recognition")
+
+# wav2vec2 model outputs: angry, disgust, fear, happy, neutral, sad, surprise
+# These map directly to our 7-class scheme
+_VOICE_LABEL_MAP = {
+    "angry"   : "anger",
+    "disgust" : "disgust",
+    "fear"    : "fear",
+    "happy"   : "happiness",
+    "neutral" : "neutral",
+    "sad"     : "sadness",
+    "surprise": "surprise",
+}
+
+
+def _call_voice_emotion(audio_bytes: bytes, filename: str = "") -> dict:
+    """
+    Send raw audio bytes to HF wav2vec2 speech emotion model.
+    Analyzes HOW you sound (tone, pitch, energy) — not what you say.
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    ct_map = {
+        "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+        "ogg": "audio/ogg", "webm": "audio/webm", "m4a": "audio/mp4",
+        "aiff": "audio/aiff", "mp4": "audio/mp4",
+    }
+    content_type = ct_map.get(ext, "audio/wav")
+    try:
+        resp = _requests.post(
+            _VOICE_EMOTION_URL,
+            headers={**_HF_HEADERS, "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response: [{"label":"happy","score":0.92}, ...]
+            if isinstance(data, list) and data:
+                mapped = {}
+                for item in data:
+                    label = item.get("label", "").lower()
+                    our_label = _VOICE_LABEL_MAP.get(label, label)
+                    mapped[our_label] = round(item.get("score", 0), 4)
+                dominant = max(mapped, key=mapped.get) if mapped else "neutral"
+                return {
+                    "success"   : True,
+                    "emotion"   : dominant,
+                    "scores"    : mapped,
+                    "confidence": round(mapped.get(dominant, 0), 4),
+                    "source"    : "voice_tone",
+                }
+            return {"success": False, "error": "Unexpected response format"}
+        else:
+            return {"success": False,
+                    "error": f"Voice API {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/voice-emotion")
+async def voice_emotion(file: UploadFile = File(...)):
+    """
+    Send an audio file → get emotion prediction based on VOICE TONE
+    (pitch, energy, speaking style) — NOT text content.
+    Uses wav2vec2 fine-tuned for speech emotion recognition via HF API.
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"success": False, "error": "Empty audio file"}
+
+    result = _call_voice_emotion(audio_bytes, file.filename or "")
+    return result
+
+
+@app.post("/api/full-multimodal")
+async def full_multimodal_detect(
+    image: UploadFile = File(...),
+    audio: UploadFile = File(None),
+):
+    """
+    Complete tri-signal multimodal emotion detection:
+      1. Face  (EfficientNet-B2, local) — HOW you look
+      2. Voice (wav2vec2, HF API)       — HOW you sound
+      3. Text  (Whisper→RoBERTa, HF API) — WHAT you say
+    Returns individual results + tri-signal fusion.
+    """
+    # ── 1. Face emotion (local) ──────────────────────────────────────
+    img_bytes = await image.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    face_result = {"success": False}
+    if frame is not None:
+        try:
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1,
+                minNeighbors=5, minSize=(48, 48))
+            if len(faces) > 0:
+                x, y, w, h = faces[0]
+                crop = frame[y:y+h, x:x+w]
+                emotion, scores = predict_face_emotion(crop)
+                face_result = {
+                    "success"   : True,
+                    "emotion"   : emotion,
+                    "scores"    : scores,
+                    "confidence": round(scores.get(emotion, 0), 4),
+                    "source"    : "face",
+                }
+        except Exception as e:
+            face_result = {"success": False, "error": str(e)}
+
+    # ── 2 & 3. Voice tone + Text (only if audio provided) ────────────
+    voice_result = None
+    text_result  = None
+    whisper_text = ""
+
+    if audio is not None:
+        audio_bytes = await audio.read()
+        if audio_bytes and len(audio_bytes) > 1000:
+            # Voice tone emotion (wav2vec2)
+            voice_result = _call_voice_emotion(
+                audio_bytes, audio.filename or "")
+
+            # Speech → text → text emotion (Whisper + RoBERTa)
+            whisper = _call_whisper(audio_bytes, audio.filename or "")
+            if whisper.get("success"):
+                whisper_text = whisper["text"]
+                if whisper_text:
+                    text_result = _call_roberta(whisper_text)
+
+    # ── 4. Tri-signal fusion ─────────────────────────────────────────
+    fused = None
+    signals = []
+    weights = []
+
+    if face_result.get("success"):
+        face_01 = {k: v / 100 if v > 1 else v
+                   for k, v in face_result["scores"].items()}
+        signals.append(face_01)
+        weights.append(0.50)   # face gets 50%
+
+    if voice_result and voice_result.get("success"):
+        signals.append(voice_result["scores"])
+        weights.append(0.30)   # voice tone gets 30%
+
+    if text_result and text_result.get("success"):
+        signals.append(text_result["scores"])
+        weights.append(0.20)   # text content gets 20%
+
+    if signals:
+        # Normalise weights to sum to 1
+        w_total = sum(weights)
+        weights = [w / w_total for w in weights]
+
+        # Weighted average across all signals
+        all_emotions = set()
+        for s in signals:
+            all_emotions.update(s.keys())
+
+        fused_scores = {}
+        for emo in all_emotions:
+            val = sum(
+                s.get(emo, 0) * w
+                for s, w in zip(signals, weights))
+            fused_scores[emo] = round(val, 4)
+
+        # Normalise
+        total = sum(fused_scores.values())
+        if total > 0:
+            fused_scores = {e: round(v / total, 4)
+                           for e, v in fused_scores.items()}
+
+        dominant   = max(fused_scores, key=fused_scores.get)
+        confidence = fused_scores.get(dominant, 0)
+
+        base_map = {
+            "happiness": 0.85, "surprise": 0.80,
+            "anger"    : 0.65, "fear"    : 0.55,
+            "disgust"  : 0.50, "sadness" : 0.35,
+            "neutral"  : 0.30,
+        }
+        eng = base_map.get(dominant, 0.5)
+        eng += max(-0.1, min(0.15, (confidence - 0.5) * 0.3))
+        eng = max(0.05, min(1.0, eng))
+
+        fused = {
+            "dominant"  : dominant,
+            "scores"    : fused_scores,
+            "confidence": round(confidence, 4),
+            "engagement": round(eng * 100, 1),
+        }
+
+    return {
+        "success"       : face_result.get("success", False),
+        "face"          : face_result,
+        "voice_tone"    : voice_result,
+        "transcription" : whisper_text or None,
+        "text_emotion"  : text_result,
+        "fused"         : fused,
+        "signals_used"  : {
+            "face" : face_result.get("success", False),
+            "voice": voice_result is not None and
+                     voice_result.get("success", False),
+            "text" : text_result is not None and
+                     text_result.get("success", False),
+        },
+        "fusion_weights": dict(zip(
+            ["face", "voice", "text"][:len(weights)],
+            [round(w, 2) for w in weights]
+        )) if weights else {},
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END VOICE EMOTION EXTENSION
+# ══════════════════════════════════════════════════════════════════════════

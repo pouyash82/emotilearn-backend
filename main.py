@@ -1623,3 +1623,1291 @@ async def full_multimodal_detect(
 # ══════════════════════════════════════════════════════════════════════════
 # END VOICE EMOTION EXTENSION
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 3 — ADVANCED ENGAGEMENT STATES
+# Rule-based layer on top of EfficientNet-B2 emotion history.
+# Detects: Flow, Boredom, Productive Struggle, Confusion, Disengagement.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+ENGAGEMENT_STATES = {
+    "flow": {
+        "label": "Flow",
+        "description": "Deep focus — sustained positive emotions with high engagement",
+        "color": "#22c55e",
+        "icon": "🟢",
+    },
+    "attentive": {
+        "label": "Attentive",
+        "description": "Actively engaged — moderate positive signals",
+        "color": "#3b82f6",
+        "icon": "🔵",
+    },
+    "boredom": {
+        "label": "Boredom",
+        "description": "Disinterested — sustained neutral with low engagement",
+        "color": "#f97316",
+        "icon": "🟠",
+    },
+    "productive_struggle": {
+        "label": "Productive Struggle",
+        "description": "Challenged but trying — negative emotions mixed with surprise",
+        "color": "#eab308",
+        "icon": "🟡",
+    },
+    "confusion": {
+        "label": "Confusion",
+        "description": "Lost — rapid emotion switching with declining engagement",
+        "color": "#a855f7",
+        "icon": "🟣",
+    },
+    "disengagement": {
+        "label": "Disengagement",
+        "description": "Checked out — sustained low engagement with negative emotions",
+        "color": "#ef4444",
+        "icon": "🔴",
+    },
+}
+
+
+def _detect_engagement_state(emotion_window: list,
+                             bbox_window: list = None,
+                             frame_size: tuple = (640, 480)) -> dict:
+    """
+    Analyze a window of recent emotion detections (last 10-20 entries)
+    and classify into an advanced engagement state.
+
+    Each entry in emotion_window: {"emotion": str, "engagement_score": float}
+    Each entry in bbox_window (optional): {"bbox": [x,y,w,h], "face_detected": bool}
+    frame_size: (width, height) of the webcam frame for position normalization.
+    """
+    if not emotion_window or len(emotion_window) < 3:
+        return {
+            "state": "attentive",
+            "confidence": 0.5,
+            **ENGAGEMENT_STATES["attentive"],
+        }
+
+    emotions = [e.get("emotion", "neutral") for e in emotion_window]
+    eng_scores = [e.get("engagement_score", 0) for e in emotion_window]
+
+    # Averages
+    avg_eng = sum(eng_scores) / len(eng_scores) if eng_scores else 0
+    # Normalize to 0-1 if scores are 0-100
+    if avg_eng > 1:
+        avg_eng = avg_eng / 100
+
+    # Emotion counts
+    counts = {}
+    for em in emotions:
+        counts[em] = counts.get(em, 0) + 1
+    total = len(emotions)
+
+    # Percentages
+    pct = {e: c / total for e, c in counts.items()}
+
+    # Unique emotions
+    unique = len(counts)
+
+    # Transitions (how many times emotion changed)
+    transitions = sum(1 for i in range(1, len(emotions))
+                      if emotions[i] != emotions[i-1])
+    transition_rate = transitions / max(1, len(emotions) - 1)
+
+    # Dominant emotion
+    dominant = max(counts, key=counts.get)
+
+    # Positive emotions
+    positive_pct = pct.get("happiness", 0) + pct.get("surprise", 0)
+    negative_pct = (pct.get("anger", 0) + pct.get("fear", 0) +
+                    pct.get("sadness", 0) + pct.get("disgust", 0))
+    neutral_pct  = pct.get("neutral", 0)
+
+    # Engagement trend (rising or falling)
+    if len(eng_scores) >= 4:
+        first_half = sum(eng_scores[:len(eng_scores)//2]) / (len(eng_scores)//2)
+        second_half = sum(eng_scores[len(eng_scores)//2:]) / (len(eng_scores) - len(eng_scores)//2)
+        eng_trend = second_half - first_half  # positive = rising
+    else:
+        eng_trend = 0
+
+    # ── Bounding box / attention metrics (optional) ───────────────────
+    face_absence_pct = 0.0       # % of frames with no face detected
+    avg_center_offset = 0.0      # how far face center is from frame center (0-1)
+    face_size_trend = 0.0        # positive = leaning in, negative = pulling back
+    position_stability = 1.0     # 1 = perfectly still, 0 = very fidgety
+
+    bbox_metrics_available = False
+
+    if bbox_window and len(bbox_window) >= 3:
+        bbox_metrics_available = True
+        fw, fh = frame_size
+        frame_cx, frame_cy = fw / 2, fh / 2
+
+        detected_boxes = []
+        absent_count = 0
+
+        for entry in bbox_window:
+            if not entry.get("face_detected", True):
+                absent_count += 1
+                continue
+            bbox = entry.get("bbox")
+            if bbox and len(bbox) == 4:
+                detected_boxes.append(bbox)
+            else:
+                absent_count += 1
+
+        face_absence_pct = absent_count / len(bbox_window)
+
+        if detected_boxes:
+            # Center offset: how far face center is from frame center
+            offsets = []
+            sizes = []
+            positions_x = []
+            positions_y = []
+            for (bx, by, bw, bh) in detected_boxes:
+                cx = bx + bw / 2
+                cy = by + bh / 2
+                # Normalize offset to 0-1
+                dx = abs(cx - frame_cx) / frame_cx
+                dy = abs(cy - frame_cy) / frame_cy
+                offsets.append((dx + dy) / 2)
+                sizes.append(bw * bh)
+                positions_x.append(cx)
+                positions_y.append(cy)
+
+            avg_center_offset = sum(offsets) / len(offsets)
+
+            # Face size trend: compare first half vs second half
+            if len(sizes) >= 4:
+                first_sizes = sum(sizes[:len(sizes)//2]) / (len(sizes)//2)
+                second_sizes = sum(sizes[len(sizes)//2:]) / (len(sizes) - len(sizes)//2)
+                # Positive = face getting bigger (leaning in)
+                face_size_trend = ((second_sizes - first_sizes) /
+                                   max(1, first_sizes)) * 10
+
+            # Position stability: low std dev = stable, high = fidgety
+            if len(positions_x) >= 3:
+                import statistics
+                std_x = statistics.stdev(positions_x) / max(1, fw)
+                std_y = statistics.stdev(positions_y) / max(1, fh)
+                # Convert to 0-1 where 1 = stable
+                position_stability = max(0, 1 - (std_x + std_y) * 5)
+
+    # ── State detection rules (emotion + bbox combined) ─────────────────
+    state = "attentive"
+    confidence = 0.5
+
+    # Apply bbox penalties/bonuses to engagement
+    bbox_penalty = 0.0
+    if bbox_metrics_available:
+        # Looking away from camera → penalty
+        if avg_center_offset > 0.4:
+            bbox_penalty += 0.15
+        # Face frequently absent → penalty
+        if face_absence_pct > 0.3:
+            bbox_penalty += 0.20
+        # Pulling back from screen → penalty
+        if face_size_trend < -0.5:
+            bbox_penalty += 0.10
+        # Very fidgety → slight penalty
+        if position_stability < 0.5:
+            bbox_penalty += 0.05
+
+    adjusted_eng = max(0, avg_eng - bbox_penalty)
+
+    # FLOW: high engagement + positive emotions + facing camera + stable
+    if (adjusted_eng >= 0.65 and positive_pct >= 0.5 and
+            unique >= 2 and transition_rate >= 0.1 and
+            face_absence_pct < 0.1):
+        confidence = min(0.95, adjusted_eng * 0.5 +
+                         positive_pct * 0.2 + position_stability * 0.3)
+        state = "flow"
+
+    # BOREDOM: low engagement + mostly neutral + few transitions
+    # bbox boost: looking away or pulling back strengthens boredom signal
+    elif (adjusted_eng < 0.40 and neutral_pct >= 0.5 and
+            transition_rate < 0.15):
+        state = "boredom"
+        bbox_boost = (avg_center_offset * 0.3 +
+                      face_absence_pct * 0.2) if bbox_metrics_available else 0
+        confidence = min(0.95, (1 - adjusted_eng) * 0.4 +
+                         neutral_pct * 0.3 + bbox_boost + 0.1)
+
+    # PRODUCTIVE STRUGGLE: challenged but still facing screen
+    elif (negative_pct >= 0.3 and pct.get("surprise", 0) >= 0.1 and
+            0.35 <= avg_eng <= 0.65 and face_absence_pct < 0.2):
+        state = "productive_struggle"
+        confidence = min(0.90, negative_pct * 0.4 +
+                         pct.get("surprise", 0) * 0.3 + 0.3)
+
+    # CONFUSION: rapid switching + declining engagement
+    elif transition_rate >= 0.5 and eng_trend < -0.05:
+        state = "confusion"
+        confidence = min(0.90, transition_rate * 0.5 + abs(eng_trend) * 2)
+
+    # DISENGAGEMENT: very low engagement + face often absent or turned away
+    elif (adjusted_eng < 0.30 and
+            ((negative_pct + neutral_pct) >= 0.7 or face_absence_pct > 0.4)):
+        state = "disengagement"
+        absence_factor = face_absence_pct * 0.3 if bbox_metrics_available else 0
+        confidence = min(0.95, (1 - adjusted_eng) * 0.4 +
+                         (negative_pct + neutral_pct) * 0.3 + absence_factor)
+
+    # ATTENTIVE: default moderate state
+    else:
+        confidence = min(0.85, adjusted_eng * 0.5 + 0.3)
+
+    return {
+        "state"     : state,
+        "confidence": round(confidence, 3),
+        **ENGAGEMENT_STATES[state],
+        "metrics"   : {
+            "avg_engagement"    : round(avg_eng, 3),
+            "adjusted_engagement": round(adjusted_eng, 3),
+            "positive_pct"      : round(positive_pct, 3),
+            "negative_pct"      : round(negative_pct, 3),
+            "neutral_pct"       : round(neutral_pct, 3),
+            "transition_rate"   : round(transition_rate, 3),
+            "engagement_trend"  : round(eng_trend, 4),
+            "unique_emotions"   : unique,
+            "dominant_emotion"  : dominant,
+            "window_size"       : total,
+        },
+        "attention_metrics": {
+            "available"          : bbox_metrics_available,
+            "face_absence_pct"   : round(face_absence_pct, 3),
+            "avg_center_offset"  : round(avg_center_offset, 3),
+            "face_size_trend"    : round(face_size_trend, 3),
+            "position_stability" : round(position_stability, 3),
+            "bbox_penalty"       : round(bbox_penalty, 3),
+        } if bbox_metrics_available else {"available": False},
+    }
+
+
+@app.post("/api/engagement-state")
+async def analyze_engagement_state(payload: dict):
+    """
+    Accepts emotion detections + optional bbox data → returns advanced
+    engagement state with attention metrics.
+
+    Body: {
+      "emotions": [{"emotion": "happiness", "engagement_score": 78}, ...],
+      "bboxes": [{"bbox": [x,y,w,h], "face_detected": true}, ...],  (optional)
+      "frame_size": [640, 480]  (optional)
+    }
+    """
+    emotions = payload.get("emotions", [])
+    if not emotions:
+        return {"success": False, "error": "No emotion data provided"}
+
+    bboxes = payload.get("bboxes", None)
+    frame_size = tuple(payload.get("frame_size", [640, 480]))
+
+    result = _detect_engagement_state(emotions, bboxes, frame_size)
+    return {"success": True, **result}
+
+
+@app.get("/api/engagement-states/info")
+async def engagement_states_info():
+    """Returns metadata about all detectable engagement states."""
+    return {
+        "states": ENGAGEMENT_STATES,
+        "methodology": (
+            "Rule-based classification over a sliding window of "
+            "EfficientNet-B2 emotion predictions combined with spatial "
+            "attention metrics derived from Haar Cascade face bounding boxes. "
+            "Emotion features: mean engagement, emotion valence distribution, "
+            "transition rate, and engagement trend. "
+            "Attention features: face center offset from frame center "
+            "(gaze proxy), face absence duration, face size trend "
+            "(leaning in/out), and position stability (fidgeting). "
+            "Six learning-relevant cognitive states are identified: "
+            "Flow, Attentive, Boredom, Productive Struggle, Confusion, "
+            "and Disengagement."
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END STEP 3 — ADVANCED ENGAGEMENT STATES
+# ══════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2 — LECTURE RECORDING ANALYTICS
+# Upload a video file → extract frames → run each through EfficientNet-B2
+# → generate a complete engagement timeline with per-frame emotions.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+import tempfile
+import json as _json
+
+@app.post("/api/lecture/analyze")
+async def analyze_lecture_video(
+    file: UploadFile = File(...),
+    sample_rate: int = 2,
+):
+    """
+    Upload a lecture recording video → get a complete engagement timeline.
+
+    - Extracts one frame every `sample_rate` seconds (default: every 2s)
+    - Runs each frame through EfficientNet-B2 for emotion detection
+    - Computes engagement score per frame
+    - Detects advanced engagement states over sliding windows
+    - Returns full timeline + summary statistics
+
+    Supports: mp4, avi, mov, webm, mkv
+    """
+    # Save uploaded video to a temp file
+    suffix = "." + (file.filename or "video.mp4").rsplit(".", 1)[-1].lower()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp.flush()
+        tmp_path = tmp.name
+        tmp.close()
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            return {"success": False, "error": "Could not open video file"}
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_sec = total_frames / fps if fps > 0 else 0
+        frame_interval = int(fps * sample_rate)
+
+        timeline = []
+        frame_idx = 0
+        analyzed = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % frame_interval == 0:
+                timestamp_sec = round(frame_idx / fps, 1)
+
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(
+                        gray, scaleFactor=1.1,
+                        minNeighbors=5, minSize=(48, 48))
+
+                    if len(faces) > 0:
+                        # Analyze largest face
+                        x, y, w, h = max(faces, key=lambda f: f[2]*f[3])
+                        crop = frame[y:y+h, x:x+w]
+                        emotion, scores = predict_face_emotion(crop)
+                        confidence = scores.get(emotion, 0)
+
+                        # Compute engagement
+                        base_map = {
+                            "happiness": 0.85, "surprise": 0.80,
+                            "anger": 0.65, "fear": 0.55,
+                            "disgust": 0.50, "sadness": 0.35,
+                            "neutral": 0.30,
+                        }
+                        eng = base_map.get(emotion, 0.5)
+                        eng += max(-0.1, min(0.15,
+                                   (confidence / 100 - 0.5) * 0.3))
+                        eng = max(0.05, min(1.0, eng))
+
+                        entry = {
+                            "timestamp"       : timestamp_sec,
+                            "timestamp_fmt"   : f"{int(timestamp_sec//60)}:{int(timestamp_sec%60):02d}",
+                            "emotion"         : emotion,
+                            "confidence"      : round(confidence, 1),
+                            "scores"          : scores,
+                            "engagement"      : round(eng * 100, 1),
+                            "faces_detected"  : len(faces),
+                        }
+                        timeline.append(entry)
+                        analyzed += 1
+                    else:
+                        timeline.append({
+                            "timestamp"     : timestamp_sec,
+                            "timestamp_fmt" : f"{int(timestamp_sec//60)}:{int(timestamp_sec%60):02d}",
+                            "emotion"       : None,
+                            "faces_detected": 0,
+                            "engagement"    : 0,
+                        })
+                except Exception as e:
+                    print(f"Frame {frame_idx} error: {e}")
+
+            frame_idx += 1
+
+        cap.release()
+
+        # ── Compute summary statistics ────────────────────────────────
+        detected = [e for e in timeline if e.get("emotion")]
+        if detected:
+            avg_eng = round(sum(e["engagement"]
+                                for e in detected) / len(detected), 1)
+            emo_counts = {}
+            for e in detected:
+                em = e["emotion"]
+                emo_counts[em] = emo_counts.get(em, 0) + 1
+            dominant = max(emo_counts, key=emo_counts.get)
+            distribution = {
+                e: round(c / len(detected) * 100, 1)
+                for e, c in emo_counts.items()
+            }
+
+            # Engagement states over sliding windows
+            window_size = min(10, len(detected))
+            state_timeline = []
+            for i in range(0, len(detected), max(1, window_size // 2)):
+                window = detected[i:i+window_size]
+                if len(window) >= 3:
+                    state = _detect_engagement_state([{
+                        "emotion": e["emotion"],
+                        "engagement_score": e["engagement"],
+                    } for e in window])
+                    state_timeline.append({
+                        "from_time"  : window[0]["timestamp_fmt"],
+                        "to_time"    : window[-1]["timestamp_fmt"],
+                        "state"      : state["state"],
+                        "label"      : state["label"],
+                        "icon"       : state["icon"],
+                        "confidence" : state["confidence"],
+                    })
+
+            # Engagement segments (high/medium/low periods)
+            segments = []
+            current_level = None
+            seg_start = None
+            for e in detected:
+                level = ("high" if e["engagement"] >= 65
+                         else "medium" if e["engagement"] >= 40
+                         else "low")
+                if level != current_level:
+                    if current_level is not None:
+                        segments.append({
+                            "level": current_level,
+                            "from" : seg_start,
+                            "to"   : e["timestamp_fmt"],
+                        })
+                    current_level = level
+                    seg_start = e["timestamp_fmt"]
+            if current_level:
+                segments.append({
+                    "level": current_level,
+                    "from" : seg_start,
+                    "to"   : detected[-1]["timestamp_fmt"],
+                })
+        else:
+            avg_eng = 0
+            dominant = None
+            distribution = {}
+            state_timeline = []
+            segments = []
+
+        return {
+            "success"         : True,
+            "video_info"      : {
+                "duration_sec"    : round(duration_sec, 1),
+                "duration_fmt"    : f"{int(duration_sec//60)}:{int(duration_sec%60):02d}",
+                "fps"             : round(fps, 1),
+                "total_frames"    : total_frames,
+                "frames_analyzed" : analyzed,
+                "sample_rate_sec" : sample_rate,
+            },
+            "summary"         : {
+                "avg_engagement"  : avg_eng,
+                "dominant_emotion": dominant,
+                "distribution"    : distribution,
+                "total_detections": len(detected),
+                "engagement_label": (
+                    "High" if avg_eng >= 65
+                    else "Medium" if avg_eng >= 40
+                    else "Low"),
+            },
+            "timeline"        : timeline,
+            "engagement_states": state_timeline,
+            "engagement_segments": segments,
+        }
+
+    except Exception as e:
+        return {"success": False, "error": f"Video analysis failed: {str(e)}"}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/lecture/analyze-multi")
+async def analyze_lecture_multi(
+    file: UploadFile = File(...),
+    sample_rate: int = 2,
+):
+    """
+    Like /api/lecture/analyze but uses multi-face detection.
+    Returns per-face timelines for classroom recordings with multiple students.
+    """
+    suffix = "." + (file.filename or "video.mp4").rsplit(".", 1)[-1].lower()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp.flush()
+        tmp_path = tmp.name
+        tmp.close()
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            return {"success": False, "error": "Could not open video file"}
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_sec = total_frames / fps if fps > 0 else 0
+        frame_interval = int(fps * sample_rate)
+
+        # Reset multi-face tracker for this analysis
+        _multi_reset()
+
+        all_results = []
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % frame_interval == 0:
+                timestamp_sec = round(frame_idx / fps, 1)
+                _, results = _detect_and_predict_multi(frame)
+                all_results.append({
+                    "timestamp"     : timestamp_sec,
+                    "timestamp_fmt" : f"{int(timestamp_sec//60)}:{int(timestamp_sec%60):02d}",
+                    "faces"         : results,
+                    "count"         : len(results),
+                })
+
+            frame_idx += 1
+
+        cap.release()
+
+        # Get the per-face profile from the multi session
+        profile = _multi_profile()
+
+        return {
+            "success"    : True,
+            "video_info" : {
+                "duration_sec"   : round(duration_sec, 1),
+                "duration_fmt"   : f"{int(duration_sec//60)}:{int(duration_sec%60):02d}",
+                "fps"            : round(fps, 1),
+                "total_frames"   : total_frames,
+                "sample_rate_sec": sample_rate,
+            },
+            "timeline"   : all_results,
+            "profile"    : profile,
+        }
+
+    except Exception as e:
+        return {"success": False, "error": f"Multi-face analysis failed: {str(e)}"}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END STEP 2 — LECTURE RECORDING ANALYTICS
+# ══════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 4 — LMS INTEGRATION API SCAFFOLDING
+# RESTful endpoints ready for LMS platforms (Moodle, Canvas, Blackboard)
+# to consume. Follows LTI-compatible patterns.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+class LMSWebhookPayload(BaseModel):
+    """Schema for LMS webhook events."""
+    platform   : str = "moodle"        # moodle, canvas, blackboard
+    event_type : str = "session_end"   # session_end, enrollment, grade_sync
+    course_id  : str = ""
+    student_id : str = ""
+    data       : dict = {}
+
+class LMSCourseSync(BaseModel):
+    """Schema for syncing a course from LMS."""
+    platform    : str
+    external_id : str
+    name        : str
+    description : str = ""
+    instructor  : str = ""
+    students    : list = []
+
+
+@app.get("/api/lms/status")
+async def lms_status():
+    """
+    Returns the LMS integration readiness status.
+    Lists which platforms are supported and what capabilities are available.
+    """
+    return {
+        "lms_integration_ready": True,
+        "api_version"          : "1.0",
+        "supported_platforms"  : {
+            "moodle"    : {
+                "status"       : "api_ready",
+                "auth_method"  : "API Token / LTI 1.3",
+                "capabilities" : [
+                    "course_sync",
+                    "student_roster_import",
+                    "engagement_export",
+                    "grade_passback",
+                    "webhook_events",
+                ],
+            },
+            "canvas"    : {
+                "status"       : "api_ready",
+                "auth_method"  : "OAuth2 / LTI 1.3",
+                "capabilities" : [
+                    "course_sync",
+                    "student_roster_import",
+                    "engagement_export",
+                    "grade_passback",
+                    "webhook_events",
+                ],
+            },
+            "blackboard": {
+                "status"       : "api_ready",
+                "auth_method"  : "REST API / LTI 1.3",
+                "capabilities" : [
+                    "course_sync",
+                    "student_roster_import",
+                    "engagement_export",
+                    "webhook_events",
+                ],
+            },
+        },
+        "endpoints": {
+            "course_sync"      : "POST /api/lms/course/sync",
+            "student_report"   : "GET  /api/lms/student/{id}/report",
+            "engagement_export": "GET  /api/lms/course/{id}/engagement",
+            "webhook"          : "POST /api/lms/webhook",
+            "health"           : "GET  /api/lms/status",
+        },
+    }
+
+
+@app.post("/api/lms/course/sync")
+async def lms_course_sync(data: LMSCourseSync):
+    """
+    Sync a course from an external LMS platform.
+    Creates or updates the course in EmotiLearn's database.
+
+    In production, this would be called by the LMS via LTI launch
+    or REST API integration.
+    """
+    return {
+        "success"    : True,
+        "message"    : f"Course '{data.name}' synced from {data.platform}",
+        "platform"   : data.platform,
+        "external_id": data.external_id,
+        "course"     : {
+            "name"       : data.name,
+            "description": data.description,
+            "instructor" : data.instructor,
+            "students"   : len(data.students),
+        },
+        "note": (
+            "This is the API scaffolding. In production, this endpoint "
+            "would create/update the course in the database and import "
+            "the student roster from the LMS."
+        ),
+    }
+
+
+@app.get("/api/lms/student/{student_id}/report")
+async def lms_student_report(student_id: int):
+    """
+    LMS-compatible student engagement report.
+    Returns data in a format that LMS gradebook integrations can consume.
+
+    Can be used for:
+    - Moodle grade passback via LTI
+    - Canvas outcome reporting
+    - Custom LMS dashboard widgets
+    """
+    # Pull real data from the session store if available
+    profile = None
+    try:
+        from models_db import AsyncSessionLocal, Session, User
+        from sqlalchemy import select, func, desc
+        async with AsyncSessionLocal() as db:
+            user_res = await db.execute(
+                select(User).where(User.id == student_id))
+            user = user_res.scalar_one_or_none()
+            if not user:
+                raise HTTPException(404, "Student not found")
+
+            sess_res = await db.execute(
+                select(Session)
+                .where(Session.user_id == student_id)
+                .order_by(desc(Session.started_at)))
+            sessions = sess_res.scalars().all()
+
+            if sessions:
+                total = len(sessions)
+                avg_eng = sum(s.avg_engagement or 0
+                              for s in sessions) / total
+                emo_counts = {}
+                for s in sessions:
+                    if s.dominant_emotion:
+                        emo_counts[s.dominant_emotion] = \
+                            emo_counts.get(s.dominant_emotion, 0) + 1
+                dominant = (max(emo_counts, key=emo_counts.get)
+                            if emo_counts else None)
+
+                profile = {
+                    "student_id"      : student_id,
+                    "student_name"    : user.name,
+                    "student_email"   : user.email,
+                    "total_sessions"  : total,
+                    "avg_engagement"  : round(avg_eng * 100, 1),
+                    "dominant_emotion": dominant,
+                    "last_session"    : (sessions[0].started_at.isoformat()
+                                        if sessions[0].started_at else None),
+                }
+            else:
+                profile = {
+                    "student_id"     : student_id,
+                    "student_name"   : user.name,
+                    "total_sessions" : 0,
+                    "avg_engagement" : 0,
+                    "dominant_emotion": None,
+                }
+    except Exception as e:
+        profile = {
+            "student_id": student_id,
+            "error"     : str(e),
+        }
+
+    return {
+        "success"  : True,
+        "format"   : "lti_outcome_compatible",
+        "profile"  : profile,
+        "lti_score": round(
+            (profile.get("avg_engagement", 0) / 100)
+            if profile else 0, 2),
+        "note": (
+            "lti_score is a 0-1 value suitable for LTI grade passback. "
+            "Map to your LMS grading scale as needed."
+        ),
+    }
+
+
+@app.get("/api/lms/course/{course_id}/engagement")
+async def lms_course_engagement(course_id: int):
+    """
+    Export class-wide engagement data for an LMS course dashboard.
+    Returns aggregated metrics suitable for LMS analytics widgets.
+    """
+    try:
+        from models_db import (AsyncSessionLocal, Session, User,
+                                Course, Lecture)
+        from sqlalchemy import select, func, desc
+        async with AsyncSessionLocal() as db:
+            course_res = await db.execute(
+                select(Course).where(Course.id == course_id))
+            course = course_res.scalar_one_or_none()
+            if not course:
+                raise HTTPException(404, "Course not found")
+
+            # Get all sessions for this course's lectures
+            sess_res = await db.execute(
+                select(Session, User.name.label("student_name"))
+                .join(User, Session.user_id == User.id)
+                .join(Lecture, Session.lecture_id == Lecture.id,
+                      isouter=True)
+                .where(Lecture.course_id == course_id)
+                .order_by(desc(Session.started_at))
+                .limit(100))
+            rows = sess_res.all()
+
+            students = {}
+            for r in rows:
+                sid = r.Session.user_id
+                if sid not in students:
+                    students[sid] = {
+                        "name"       : r.student_name,
+                        "sessions"   : 0,
+                        "total_eng"  : 0,
+                    }
+                students[sid]["sessions"] += 1
+                students[sid]["total_eng"] += (r.Session.avg_engagement or 0)
+
+            student_list = []
+            for sid, data in students.items():
+                avg = round(data["total_eng"] / data["sessions"] * 100, 1) \
+                    if data["sessions"] else 0
+                student_list.append({
+                    "student_id"    : sid,
+                    "name"          : data["name"],
+                    "sessions"      : data["sessions"],
+                    "avg_engagement": avg,
+                    "lti_score"     : round(avg / 100, 2),
+                })
+
+            class_avg = (round(
+                sum(s["avg_engagement"] for s in student_list) /
+                len(student_list), 1)
+                if student_list else 0)
+
+            return {
+                "success"        : True,
+                "course"         : {
+                    "id"  : course.id,
+                    "name": course.name,
+                },
+                "class_avg_engagement": class_avg,
+                "total_students"     : len(student_list),
+                "total_sessions"     : sum(s["sessions"]
+                                           for s in student_list),
+                "students"           : student_list,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/lms/webhook")
+async def lms_webhook(payload: LMSWebhookPayload):
+    """
+    Receive webhook events from LMS platforms.
+    In production, this would trigger actions like:
+    - Auto-start a session when a lecture begins
+    - Sync grades when a session ends
+    - Update student roster on enrollment changes
+    """
+    print(f"LMS Webhook: {payload.platform} / {payload.event_type}")
+    return {
+        "success"   : True,
+        "received"  : True,
+        "platform"  : payload.platform,
+        "event_type": payload.event_type,
+        "message"   : f"Webhook from {payload.platform} processed "
+                      f"({payload.event_type})",
+        "note": (
+            "This is the webhook scaffolding. In production, each "
+            "event_type would trigger specific actions in the system."
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END STEP 4 — LMS INTEGRATION API SCAFFOLDING
+# ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# EXAM MONITORING EXTENSION — Attention & interaction tracking for
+# online exams/quizzes. Uses face bbox (gaze region + absence streaks)
+# + keystroke/click timestamps (interaction gaps) to produce a
+# focus/distraction timeline and integrity score.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+# In-memory exam session storage (separate from learning sessions)
+_exam_sessions = {}
+
+GAZE_REGIONS = {
+    "center"      : "Focused on exam area",
+    "top_left"    : "Looking at top-left (possible second monitor)",
+    "top_right"   : "Looking at top-right (possible second monitor)",
+    "bottom_left" : "Looking down-left (possible phone/notes)",
+    "bottom_right": "Looking down-right (possible phone/notes)",
+    "top"         : "Looking up",
+    "bottom"      : "Looking down (phone/desk)",
+    "left"        : "Looking left (possible second screen)",
+    "right"       : "Looking right (possible second screen)",
+    "absent"      : "Face not detected (looking away)",
+}
+
+FOCUS_THRESHOLDS = {
+    "center_tolerance"       : 0.25,    # 25% of frame from center = still "center"
+    "absence_warning_sec"    : 5,       # 5s away = warning
+    "absence_critical_sec"   : 15,      # 15s away = critical flag
+    "interaction_gap_warning": 30,      # 30s no typing/clicking = warning
+    "interaction_gap_critical": 60,     # 60s no interaction = critical
+}
+
+
+def _classify_gaze_region(bbox, frame_w, frame_h):
+    """
+    Given a face bounding box [x, y, w, h] and the frame dimensions,
+    classify which region of the screen the student is looking at.
+    """
+    if bbox is None:
+        return "absent"
+
+    x, y, w, h = bbox
+    cx = (x + w / 2) / frame_w    # 0-1 normalized
+    cy = (y + h / 2) / frame_h    # 0-1 normalized
+
+    tol = FOCUS_THRESHOLDS["center_tolerance"]
+
+    # Center zone
+    if (0.5 - tol) <= cx <= (0.5 + tol) and (0.5 - tol) <= cy <= (0.5 + tol):
+        return "center"
+
+    # Edge regions
+    if cy < 0.35:
+        if cx < 0.35:
+            return "top_left"
+        elif cx > 0.65:
+            return "top_right"
+        return "top"
+    elif cy > 0.65:
+        if cx < 0.35:
+            return "bottom_left"
+        elif cx > 0.65:
+            return "bottom_right"
+        return "bottom"
+    else:
+        if cx < 0.35:
+            return "left"
+        elif cx > 0.65:
+            return "right"
+        return "center"
+
+
+def _analyze_exam_attention(detections: list, interactions: list,
+                            frame_size: tuple = (640, 480)) -> dict:
+    """
+    Full exam attention analysis.
+
+    detections: [{"timestamp": float, "bbox": [x,y,w,h] or None,
+                  "face_detected": bool, "emotion": str,
+                  "engagement_score": float}, ...]
+    interactions: [{"timestamp": float, "type": "keypress"|"click"}, ...]
+    """
+    fw, fh = frame_size
+    total_detections = len(detections)
+
+    if total_detections == 0:
+        return {"success": False, "error": "No detection data"}
+
+    # ── Gaze region timeline ──────────────────────────────────────────
+    gaze_timeline = []
+    region_counts = {}
+    for d in detections:
+        bbox = d.get("bbox") if d.get("face_detected", True) else None
+        region = _classify_gaze_region(bbox, fw, fh)
+        gaze_timeline.append({
+            "timestamp": d.get("timestamp", 0),
+            "region"   : region,
+            "emotion"  : d.get("emotion", "neutral"),
+        })
+        region_counts[region] = region_counts.get(region, 0) + 1
+
+    # Region percentages
+    region_pct = {r: round(c / total_detections * 100, 1)
+                  for r, c in region_counts.items()}
+    focus_pct = region_pct.get("center", 0)
+
+    # ── Face absence streaks ──────────────────────────────────────────
+    absence_streaks = []
+    current_streak = 0
+    streak_start = None
+    sample_interval = 3   # seconds between detections
+
+    for i, d in enumerate(detections):
+        if not d.get("face_detected", True) or d.get("bbox") is None:
+            if current_streak == 0:
+                streak_start = d.get("timestamp", i * sample_interval)
+            current_streak += 1
+        else:
+            if current_streak > 0:
+                streak_duration = current_streak * sample_interval
+                absence_streaks.append({
+                    "start_sec"   : streak_start,
+                    "duration_sec": streak_duration,
+                    "severity"    : (
+                        "critical" if streak_duration >= FOCUS_THRESHOLDS["absence_critical_sec"]
+                        else "warning" if streak_duration >= FOCUS_THRESHOLDS["absence_warning_sec"]
+                        else "normal"),
+                })
+            current_streak = 0
+
+    # Handle streak at end
+    if current_streak > 0:
+        streak_duration = current_streak * sample_interval
+        absence_streaks.append({
+            "start_sec"   : streak_start,
+            "duration_sec": streak_duration,
+            "severity"    : (
+                "critical" if streak_duration >= FOCUS_THRESHOLDS["absence_critical_sec"]
+                else "warning" if streak_duration >= FOCUS_THRESHOLDS["absence_warning_sec"]
+                else "normal"),
+        })
+
+    total_absence_sec = sum(s["duration_sec"] for s in absence_streaks)
+    session_duration = (detections[-1].get("timestamp", 0) -
+                        detections[0].get("timestamp", 0)) + sample_interval
+    absence_pct = round(total_absence_sec / max(1, session_duration) * 100, 1)
+
+    # ── Interaction gap analysis ──────────────────────────────────────
+    interaction_gaps = []
+    if interactions and len(interactions) >= 2:
+        sorted_interactions = sorted(interactions, key=lambda x: x.get("timestamp", 0))
+        for i in range(1, len(sorted_interactions)):
+            gap = (sorted_interactions[i]["timestamp"] -
+                   sorted_interactions[i-1]["timestamp"])
+            if gap >= FOCUS_THRESHOLDS["interaction_gap_warning"]:
+                interaction_gaps.append({
+                    "start_sec"   : sorted_interactions[i-1]["timestamp"],
+                    "duration_sec": round(gap, 1),
+                    "severity"    : (
+                        "critical" if gap >= FOCUS_THRESHOLDS["interaction_gap_critical"]
+                        else "warning"),
+                })
+
+    avg_interaction_gap = 0
+    if interactions and len(interactions) >= 2:
+        sorted_ts = sorted(x["timestamp"] for x in interactions)
+        gaps = [sorted_ts[i] - sorted_ts[i-1] for i in range(1, len(sorted_ts))]
+        avg_interaction_gap = round(sum(gaps) / len(gaps), 1) if gaps else 0
+
+    # ── Distraction events (looking away + not typing) ────────────────
+    distraction_events = []
+    for streak in absence_streaks:
+        if streak["severity"] in ("warning", "critical"):
+            # Check if there was also no interaction during this period
+            start = streak["start_sec"]
+            end = start + streak["duration_sec"]
+            had_interaction = any(
+                start <= i.get("timestamp", 0) <= end
+                for i in (interactions or []))
+            distraction_events.append({
+                "start_sec"   : start,
+                "duration_sec": streak["duration_sec"],
+                "looked_away" : True,
+                "was_typing"  : had_interaction,
+                "severity"    : streak["severity"],
+            })
+
+    # ── Overall integrity / focus score (0-100) ───────────────────────
+    # Starts at 100, penalties deducted
+    score = 100.0
+
+    # Penalty for non-center gaze time
+    off_center_pct = 100 - focus_pct
+    score -= off_center_pct * 0.3    # max -30
+
+    # Penalty for absence
+    score -= absence_pct * 0.4       # max -40
+
+    # Penalty for critical absence streaks
+    critical_streaks = [s for s in absence_streaks
+                        if s["severity"] == "critical"]
+    score -= len(critical_streaks) * 5   # -5 per critical streak
+
+    # Penalty for long interaction gaps
+    score -= len(interaction_gaps) * 3   # -3 per long gap
+
+    score = max(0, min(100, round(score, 1)))
+
+    focus_label = ("Excellent" if score >= 85
+                   else "Good" if score >= 70
+                   else "Moderate" if score >= 50
+                   else "Poor" if score >= 30
+                   else "Critical")
+
+    return {
+        "success"       : True,
+        "focus_score"   : score,
+        "focus_label"   : focus_label,
+        "session_duration_sec": round(session_duration, 1),
+        "gaze_analysis" : {
+            "focus_pct"    : focus_pct,
+            "region_breakdown": region_pct,
+            "region_descriptions": {
+                r: GAZE_REGIONS.get(r, r) for r in region_pct
+            },
+        },
+        "absence_analysis": {
+            "total_absence_sec"  : total_absence_sec,
+            "absence_pct"        : absence_pct,
+            "streaks"            : absence_streaks,
+            "longest_streak_sec" : (max(s["duration_sec"] for s in absence_streaks)
+                                    if absence_streaks else 0),
+            "critical_count"     : len(critical_streaks),
+        },
+        "interaction_analysis": {
+            "total_interactions"  : len(interactions or []),
+            "avg_gap_sec"         : avg_interaction_gap,
+            "long_gaps"           : interaction_gaps,
+        },
+        "distraction_events": distraction_events,
+        "gaze_timeline"    : gaze_timeline[-100:],   # last 100 entries
+    }
+
+
+@app.post("/api/exam/start")
+async def exam_start(payload: dict):
+    """
+    Start an exam monitoring session.
+    Body: {"exam_id": "quiz_1", "student_id": 1}
+    """
+    exam_id = payload.get("exam_id", f"exam_{int(time.time())}")
+    student_id = payload.get("student_id", 0)
+    _exam_sessions[exam_id] = {
+        "student_id"  : student_id,
+        "started_at"  : datetime.now().isoformat(),
+        "detections"  : [],
+        "interactions" : [],
+        "frame_size"  : (640, 480),
+    }
+    return {
+        "success"   : True,
+        "exam_id"   : exam_id,
+        "started_at": _exam_sessions[exam_id]["started_at"],
+    }
+
+
+@app.post("/api/exam/detection")
+async def exam_add_detection(payload: dict):
+    """
+    Log a single detection during an exam.
+    Body: {
+      "exam_id": "quiz_1",
+      "timestamp": 12.5,
+      "bbox": [x, y, w, h] or null,
+      "face_detected": true,
+      "emotion": "neutral",
+      "engagement_score": 45
+    }
+    """
+    exam_id = payload.get("exam_id", "")
+    if exam_id not in _exam_sessions:
+        return {"success": False, "error": "Exam session not found"}
+
+    _exam_sessions[exam_id]["detections"].append({
+        "timestamp"       : payload.get("timestamp", 0),
+        "bbox"            : payload.get("bbox"),
+        "face_detected"   : payload.get("face_detected", True),
+        "emotion"         : payload.get("emotion", "neutral"),
+        "engagement_score": payload.get("engagement_score", 0),
+    })
+
+    if payload.get("frame_size"):
+        _exam_sessions[exam_id]["frame_size"] = tuple(payload["frame_size"])
+
+    return {"success": True, "detections_count": len(
+        _exam_sessions[exam_id]["detections"])}
+
+
+@app.post("/api/exam/interaction")
+async def exam_add_interaction(payload: dict):
+    """
+    Log keyboard/mouse interactions during an exam.
+    Body: {
+      "exam_id": "quiz_1",
+      "interactions": [
+        {"timestamp": 5.2, "type": "keypress"},
+        {"timestamp": 7.8, "type": "click"},
+        ...
+      ]
+    }
+    """
+    exam_id = payload.get("exam_id", "")
+    if exam_id not in _exam_sessions:
+        return {"success": False, "error": "Exam session not found"}
+
+    new_interactions = payload.get("interactions", [])
+    _exam_sessions[exam_id]["interactions"].extend(new_interactions)
+
+    return {"success": True, "total_interactions": len(
+        _exam_sessions[exam_id]["interactions"])}
+
+
+@app.post("/api/exam/end")
+async def exam_end(payload: dict):
+    """
+    End an exam session and get the full attention analysis report.
+    Body: {"exam_id": "quiz_1"}
+    """
+    exam_id = payload.get("exam_id", "")
+    if exam_id not in _exam_sessions:
+        return {"success": False, "error": "Exam session not found"}
+
+    session = _exam_sessions[exam_id]
+    result = _analyze_exam_attention(
+        session["detections"],
+        session["interactions"],
+        session["frame_size"],
+    )
+
+    result["exam_id"]    = exam_id
+    result["student_id"] = session["student_id"]
+    result["started_at"] = session["started_at"]
+    result["ended_at"]   = datetime.now().isoformat()
+
+    # Keep session for retrieval, but mark as ended
+    session["ended_at"] = result["ended_at"]
+    session["result"]   = result
+
+    return result
+
+
+@app.get("/api/exam/{exam_id}/report")
+async def exam_report(exam_id: str):
+    """
+    Retrieve the attention analysis report for a completed exam.
+    """
+    if exam_id not in _exam_sessions:
+        raise HTTPException(404, "Exam session not found")
+
+    session = _exam_sessions[exam_id]
+    if "result" in session:
+        return session["result"]
+
+    # Generate report on the fly if exam hasn't been formally ended
+    result = _analyze_exam_attention(
+        session["detections"],
+        session["interactions"],
+        session["frame_size"],
+    )
+    result["exam_id"]    = exam_id
+    result["student_id"] = session["student_id"]
+    result["started_at"] = session["started_at"]
+    result["status"]     = "in_progress"
+    return result
+
+
+@app.post("/api/exam/analyze")
+async def exam_analyze_batch(payload: dict):
+    """
+    One-shot analysis — send all data at once instead of streaming.
+    Body: {
+      "detections": [{"timestamp": 0, "bbox": [x,y,w,h], "face_detected": true,
+                       "emotion": "neutral", "engagement_score": 50}, ...],
+      "interactions": [{"timestamp": 5.2, "type": "keypress"}, ...],
+      "frame_size": [640, 480]
+    }
+    """
+    detections = payload.get("detections", [])
+    interactions = payload.get("interactions", [])
+    frame_size = tuple(payload.get("frame_size", [640, 480]))
+
+    if not detections:
+        return {"success": False, "error": "No detection data"}
+
+    return _analyze_exam_attention(detections, interactions, frame_size)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END EXAM MONITORING EXTENSION
+# ══════════════════════════════════════════════════════════════════════════

@@ -2912,165 +2912,133 @@ async def exam_analyze_batch(payload: dict):
 # END EXAM MONITORING EXTENSION
 # ══════════════════════════════════════════════════════════════════════════
 
+
 # ══════════════════════════════════════════════════════════════════════════
-# EYE GAZE DETECTION — Pupil position tracking within detected eyes.
-# Uses OpenCV's haarcascade_eye + pupil center estimation for gaze direction.
+# EXAM ATTENTION TRACKING — Face distance + proportional eye tracking
+# + interaction timing. Calibrated for 30-45cm laptop distance.
+# No Haar eye cascade — uses face geometry for reliable eye location.
 # Nothing above this line was changed.
 # ══════════════════════════════════════════════════════════════════════════
 
-_eye_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_eye.xml')
+FACE_DISTANCE_CONFIG = {
+    "baseline_face_width"  : 300,
+    "focal_length_estimate": 300 * 35,
+    "min_normal_cm"        : 25,
+    "max_normal_cm"        : 55,
+}
+
+EYE_PROPORTIONS = {
+    "y_top"     : 0.25,
+    "y_bottom"  : 0.42,
+    "left_x"    : 0.10,
+    "left_x_end": 0.45,
+    "right_x"   : 0.55,
+    "right_x_end": 0.90,
+}
 
 
-def _detect_gaze(frame_bgr):
-    """
-    Detect face → find eyes within face → locate pupil position
-    → classify gaze direction.
+def _estimate_face_distance(face_width_px):
+    if face_width_px <= 0:
+        return 999
+    return round(FACE_DISTANCE_CONFIG["focal_length_estimate"] / face_width_px, 1)
 
-    Returns:
-    {
-        "face_detected": bool,
-        "face_bbox": [x,y,w,h],
-        "eyes_detected": int,
-        "gaze_direction": "center"|"left"|"right"|"up"|"down"|"away",
-        "gaze_confidence": float,
-        "pupil_offset": {"x": float, "y": float},  # -1 to 1 normalized
-        "eye_regions": [{"bbox":[x,y,w,h], "pupil":[px,py]}, ...],
-    }
-    """
-    result = {
-        "face_detected": False,
-        "eyes_detected": 0,
-        "gaze_direction": "away",
-        "gaze_confidence": 0.0,
-        "pupil_offset": {"x": 0, "y": 0},
-    }
 
-    try:
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+def _track_eye_gaze_proportional(gray_frame, face_bbox):
+    fx, fy, fw, fh = face_bbox
+    h_frame, w_frame = gray_frame.shape[:2]
 
-        # Detect face
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
-        if len(faces) == 0:
-            return result
+    y_top    = max(0, int(fy + fh * EYE_PROPORTIONS["y_top"]))
+    y_bottom = min(h_frame, int(fy + fh * EYE_PROPORTIONS["y_bottom"]))
+    left_x1  = max(0, int(fx + fw * EYE_PROPORTIONS["left_x"]))
+    left_x2  = min(w_frame, int(fx + fw * EYE_PROPORTIONS["left_x_end"]))
+    right_x1 = max(0, int(fx + fw * EYE_PROPORTIONS["right_x"]))
+    right_x2 = min(w_frame, int(fx + fw * EYE_PROPORTIONS["right_x_end"]))
 
-        # Use largest face
-        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        result["face_detected"] = True
-        result["face_bbox"] = [int(fx), int(fy), int(fw), int(fh)]
+    if y_bottom - y_top < 5 or left_x2 - left_x1 < 5:
+        return {"direction": "unknown", "confidence": 0, "offset_x": 0}
 
-        # Crop face region — only upper 60% where eyes are
-        face_upper = gray[fy:fy + int(fh * 0.65), fx:fx + fw]
-        if face_upper.size == 0:
-            return result
+    left_eye  = gray_frame[y_top:y_bottom, left_x1:left_x2]
+    right_eye = gray_frame[y_top:y_bottom, right_x1:right_x2]
 
-        # Detect eyes within face
-        eyes = _eye_cascade.detectMultiScale(
-            face_upper, scaleFactor=1.1, minNeighbors=5,
-            minSize=(20, 20), maxSize=(int(fw * 0.45), int(fh * 0.35)))
-
-        if len(eyes) < 1:
-            # Eyes not detected — possibly closed or looking far away
-            result["gaze_direction"] = "away"
-            result["gaze_confidence"] = 0.7
-            return result
-
-        result["eyes_detected"] = len(eyes)
-        eye_regions = []
-        pupil_offsets_x = []
-        pupil_offsets_y = []
-
-        for (ex, ey, ew, eh) in eyes[:2]:  # max 2 eyes
-            # Extract eye region
-            eye_roi = face_upper[ey:ey + eh, ex:ex + ew]
-            if eye_roi.size == 0:
-                continue
-
-            # Find pupil: darkest region in the eye
-            # Apply heavy blur to reduce noise from eyelashes, reflections
-            eye_blur = cv2.GaussianBlur(eye_roi, (11, 11), 0)
-
-            # Check if the eye region has enough contrast to detect pupil
-            min_val, max_val, min_loc, _ = cv2.minMaxLoc(eye_blur)
-            contrast = max_val - min_val
-
-            # If contrast is too low, pupil detection is unreliable
-            # → assume center (benefit of the doubt)
-            if contrast < 30:
-                pupil_x = ew // 2
-                pupil_y = eh // 2
-            else:
-                # Use threshold to find dark blob (pupil/iris area)
-                threshold = min_val + contrast * 0.3
-                _, binary = cv2.threshold(eye_blur, int(threshold),
-                                          255, cv2.THRESH_BINARY_INV)
-
-                # Find centroid of the dark region (more stable than single pixel)
-                moments = cv2.moments(binary)
-                if moments["m00"] > 0:
-                    pupil_x = int(moments["m10"] / moments["m00"])
-                    pupil_y = int(moments["m01"] / moments["m00"])
-                else:
-                    pupil_x, pupil_y = min_loc  # fallback to darkest point
-
-            # Normalize pupil position within the eye: -1 to 1
-            # 0 = centered, -1 = far left/top, 1 = far right/bottom
-            norm_x = (pupil_x / max(1, ew) - 0.5) * 2  # -1 to 1
-            norm_y = (pupil_y / max(1, eh) - 0.5) * 2
-
-            pupil_offsets_x.append(norm_x)
-            pupil_offsets_y.append(norm_y)
-
-            eye_regions.append({
-                "bbox": [int(ex + fx), int(ey + fy), int(ew), int(eh)],
-                "pupil": [int(pupil_x + ex + fx), int(pupil_y + ey + fy)],
-                "offset": {"x": round(norm_x, 3), "y": round(norm_y, 3)},
-            })
-
-        result["eye_regions"] = eye_regions
-
-        if not pupil_offsets_x:
-            return result
-
-        # Average pupil offset across both eyes
-        avg_x = sum(pupil_offsets_x) / len(pupil_offsets_x)
-        avg_y = sum(pupil_offsets_y) / len(pupil_offsets_y)
-        result["pupil_offset"] = {"x": round(avg_x, 3), "y": round(avg_y, 3)}
-
-        # Classify gaze direction from pupil offset
-        # Thresholds calibrated for typical webcam usage
-        x_thresh = 0.35   # balanced — catches real glances, ignores small movements
-        y_thresh = 0.35
-
-        if abs(avg_x) <= x_thresh and abs(avg_y) <= y_thresh:
-            result["gaze_direction"] = "center"
-            result["gaze_confidence"] = round(
-                1.0 - (abs(avg_x) + abs(avg_y)) / 2, 3)
-        elif abs(avg_x) > abs(avg_y):
-            # Horizontal gaze dominant
-            result["gaze_direction"] = "left" if avg_x < 0 else "right"
-            result["gaze_confidence"] = round(min(0.95, abs(avg_x)), 3)
+    gaze_offsets = []
+    for eye_roi in [left_eye, right_eye]:
+        if eye_roi.size == 0 or eye_roi.shape[0] < 5 or eye_roi.shape[1] < 5:
+            continue
+        ew = eye_roi.shape[1]
+        blurred = cv2.GaussianBlur(eye_roi, (9, 9), 0)
+        min_val, max_val, _, _ = cv2.minMaxLoc(blurred)
+        if max_val - min_val < 20:
+            gaze_offsets.append(0.0)
+            continue
+        threshold_val = min_val + (max_val - min_val) * 0.35
+        _, binary = cv2.threshold(blurred, int(threshold_val), 255, cv2.THRESH_BINARY_INV)
+        moments = cv2.moments(binary)
+        if moments["m00"] > 0:
+            cx = moments["m10"] / moments["m00"]
+            gaze_offsets.append((cx / max(1, ew) - 0.5) * 2)
         else:
-            # Vertical gaze dominant
-            result["gaze_direction"] = "up" if avg_y < 0 else "down"
-            result["gaze_confidence"] = round(min(0.95, abs(avg_y)), 3)
+            gaze_offsets.append(0.0)
 
-    except Exception as e:
-        print(f"Gaze detection error: {e}")
+    if not gaze_offsets:
+        return {"direction": "unknown", "confidence": 0, "offset_x": 0}
 
-    return result
+    avg_offset = sum(gaze_offsets) / len(gaze_offsets)
+    gaze_thresh = 0.35
+
+    if abs(avg_offset) <= gaze_thresh:
+        direction = "center"
+        confidence = round(1.0 - abs(avg_offset), 3)
+    elif avg_offset < -gaze_thresh:
+        direction = "left"
+        confidence = round(min(0.95, abs(avg_offset)), 3)
+    else:
+        direction = "right"
+        confidence = round(min(0.95, abs(avg_offset)), 3)
+
+    return {"direction": direction, "confidence": confidence,
+            "offset_x": round(avg_offset, 3), "eyes_found": len(gaze_offsets)}
+
+
+def _analyze_interaction_timing(interactions):
+    if not interactions or len(interactions) < 2:
+        return {"total": len(interactions or []), "avg_gap": 0, "max_gap": 0,
+                "idle_periods": [], "typing_bursts": 0, "answer_gaps": []}
+
+    sorted_i = sorted(interactions, key=lambda x: x.get("timestamp", 0))
+    gaps = []
+    for i in range(1, len(sorted_i)):
+        gap = sorted_i[i]["timestamp"] - sorted_i[i-1]["timestamp"]
+        gaps.append({"start": sorted_i[i-1]["timestamp"],
+                     "duration": round(gap, 1),
+                     "type": sorted_i[i].get("type", "unknown")})
+
+    idle_periods = [g for g in gaps if g["duration"] > 15]
+    answer_gaps  = [g for g in gaps if g["type"] == "click" and g["duration"] > 10]
+    typing_bursts = 0
+    burst = 0
+    for g in gaps:
+        if g["type"] == "keypress" and g["duration"] < 2:
+            burst += 1
+        else:
+            if burst >= 3: typing_bursts += 1
+            burst = 0
+
+    return {
+        "total": len(interactions),
+        "avg_gap": round(sum(g["duration"] for g in gaps) / len(gaps), 1),
+        "max_gap": round(max(g["duration"] for g in gaps), 1),
+        "idle_periods": idle_periods[:20],
+        "typing_bursts": typing_bursts,
+        "answer_gaps": answer_gaps[:20],
+        "rapid_actions": len([g for g in gaps if g["duration"] < 0.5]),
+    }
 
 
 @app.post("/api/exam/detect-with-gaze")
 async def exam_detect_with_gaze(file: UploadFile = File(...)):
     """
-    Combined exam proctoring detection:
-    1. Face emotion (EfficientNet-B2)
-    2. Head position (face bbox in frame)
-    3. Eye gaze direction (pupil position within eyes)
-
-    Returns all three signals for comprehensive attention monitoring.
+    Exam proctoring: face emotion + face distance (30-45cm calibrated)
+    + head position + proportional eye gaze tracking.
     """
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
@@ -3079,100 +3047,102 @@ async def exam_detect_with_gaze(file: UploadFile = File(...)):
         return {"success": False, "error": "Invalid image"}
 
     frame_h, frame_w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # 1. Emotion detection (existing pipeline)
+    # Face detection + emotion
     emotion_result = {"emotion": None, "engagement": 0}
+    face_bbox = None
     try:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
         if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-            crop = frame[y:y+h, x:x+w]
+            fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            face_bbox = [int(fx), int(fy), int(fw), int(fh)]
+            crop = frame[fy:fy+fh, fx:fx+fw]
             emotion, scores = predict_face_emotion(crop)
             emotion_result = {
-                "emotion": emotion,
-                "scores": scores,
+                "emotion": emotion, "scores": scores,
                 "confidence": round(scores.get(emotion, 0), 4),
                 "engagement": round(scores.get(emotion, 0) * 0.85, 1),
-                "bbox": [int(x), int(y), int(w), int(h)],
+                "bbox": face_bbox,
             }
-    except Exception:
-        pass
+    except Exception as e:
+        emotion_result["error"] = str(e)
 
-    # 2. Head position (bbox relative to frame)
-    head_region = "absent"
-    if emotion_result.get("bbox"):
-        bx, by, bw, bh = emotion_result["bbox"]
-        cx = (bx + bw / 2) / frame_w
-        cy = (by + bh / 2) / frame_h
-        tol = 0.30
-        if (0.5 - tol) <= cx <= (0.5 + tol) and (0.5 - tol) <= cy <= (0.5 + tol):
-            head_region = "center"
-        elif cx < 0.25:
-            head_region = "left"
-        elif cx > 0.75:
-            head_region = "right"
-        elif cy < 0.25:
-            head_region = "top"
-        elif cy > 0.75:
-            head_region = "bottom"
-        else:
-            head_region = "center"
+    if face_bbox is None:
+        return {
+            "success": False,
+            "emotion": emotion_result,
+            "attention": {"status": "absent", "score": 0,
+                         "head_ok": False, "eyes_ok": False, "distance_ok": False},
+            "head_position": {"region": "absent", "focused": False},
+            "eye_gaze": {"direction": "away", "confidence": 0},
+            "face_distance": {"cm": 0, "status": "absent"},
+        }
 
-    # 3. Eye gaze (pupil tracking)
-    gaze = _detect_gaze(frame)
+    fx, fy, fw, fh = face_bbox
 
-    # Combined attention assessment
+    # Face distance
+    distance_cm = _estimate_face_distance(fw)
+    min_cm = FACE_DISTANCE_CONFIG["min_normal_cm"]
+    max_cm = FACE_DISTANCE_CONFIG["max_normal_cm"]
+    distance_status = ("too_close" if distance_cm < min_cm
+                       else "too_far" if distance_cm > max_cm else "normal")
+    distance_ok = distance_status == "normal"
+
+    # Head position
+    cx = (fx + fw / 2) / frame_w
+    cy = (fy + fh / 2) / frame_h
+    tol = 0.30
+    if (0.5 - tol) <= cx <= (0.5 + tol) and (0.5 - tol) <= cy <= (0.5 + tol):
+        head_region = "center"
+    elif cx < 0.25: head_region = "left"
+    elif cx > 0.75: head_region = "right"
+    elif cy < 0.25: head_region = "top"
+    elif cy > 0.75: head_region = "bottom"
+    else: head_region = "center"
     head_focused = head_region == "center"
-    eyes_focused = gaze.get("gaze_direction") == "center"
-    eyes_detected = gaze.get("eyes_detected", 0) > 0
-    face_detected = gaze.get("face_detected", False)
 
-    if not face_detected:
-        attention = "absent"
-        attention_score = 0
-    elif head_focused and eyes_focused:
-        attention = "fully_focused"
-        attention_score = 100
-    elif head_focused and not eyes_detected:
-        attention = "eyes_closed_or_hidden"
-        attention_score = 40
+    # Eye gaze via proportional analysis
+    gaze = _track_eye_gaze_proportional(gray, face_bbox)
+    eyes_focused = gaze["direction"] == "center"
+
+    # Combined attention
+    if head_focused and eyes_focused and distance_ok:
+        status, score = "fully_focused", 100
+    elif head_focused and eyes_focused and not distance_ok:
+        status, score = "wrong_distance", 70
     elif head_focused and not eyes_focused:
-        attention = "eyes_wandering"
-        attention_score = 50
-    elif not head_focused and eyes_focused:
-        attention = "head_turned"
-        attention_score = 30
+        status, score = "eyes_wandering", 50
+    elif not head_focused and distance_ok:
+        status, score = "head_turned", 30
+    elif not head_focused and not distance_ok:
+        status, score = "distracted", 15
     else:
-        attention = "distracted"
-        attention_score = 15
+        status, score = "attentive", 65
 
     return {
-        "success"       : face_detected,
-        "frame_size"    : [frame_w, frame_h],
-        "emotion"       : emotion_result,
-        "head_position" : {
-            "region"  : head_region,
-            "focused" : head_focused,
-            "bbox"    : emotion_result.get("bbox"),
-        },
-        "eye_gaze"      : {
-            "direction"     : gaze.get("gaze_direction", "away"),
-            "confidence"    : gaze.get("gaze_confidence", 0),
-            "eyes_detected" : gaze.get("eyes_detected", 0),
-            "pupil_offset"  : gaze.get("pupil_offset", {}),
-            "focused"       : eyes_focused,
-        },
-        "attention"     : {
-            "status"  : attention,
-            "score"   : attention_score,
-            "head_ok" : head_focused,
-            "eyes_ok" : eyes_focused,
-        },
+        "success": True,
+        "frame_size": [frame_w, frame_h],
+        "emotion": emotion_result,
+        "head_position": {"region": head_region, "focused": head_focused, "bbox": face_bbox},
+        "eye_gaze": {"direction": gaze["direction"], "confidence": gaze["confidence"],
+                     "offset_x": gaze.get("offset_x", 0), "focused": eyes_focused},
+        "face_distance": {"cm": distance_cm, "status": distance_status,
+                         "normal": distance_ok, "range": f"{min_cm}-{max_cm}cm"},
+        "attention": {"status": status, "score": score,
+                     "head_ok": head_focused, "eyes_ok": eyes_focused,
+                     "distance_ok": distance_ok},
     }
 
 
+@app.post("/api/exam/interaction-analysis")
+async def exam_interaction_analysis(payload: dict):
+    """Analyze interaction timing patterns during an exam."""
+    return {"success": True, **_analyze_interaction_timing(
+        payload.get("interactions", []))}
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# END EYE GAZE DETECTION
+# END EXAM ATTENTION TRACKING
 # ══════════════════════════════════════════════════════════════════════════

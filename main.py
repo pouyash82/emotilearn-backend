@@ -2536,7 +2536,7 @@ GAZE_REGIONS = {
 }
 
 FOCUS_THRESHOLDS = {
-    "center_tolerance"       : 0.25,    # 25% of frame from center = still "center"
+    "center_tolerance"       : 0.35,    # 35% of frame from center = still "center"
     "absence_warning_sec"    : 5,       # 5s away = warning
     "absence_critical_sec"   : 15,      # 15s away = critical flag
     "interaction_gap_warning": 30,      # 30s no typing/clicking = warning
@@ -2961,7 +2961,7 @@ def _detect_gaze(frame_bgr):
         result["face_bbox"] = [int(fx), int(fy), int(fw), int(fh)]
 
         # Crop face region — only upper 60% where eyes are
-        face_upper = gray[fy:fy + int(fh * 0.6), fx:fx + fw]
+        face_upper = gray[fy:fy + int(fh * 0.65), fx:fx + fw]
         if face_upper.size == 0:
             return result
 
@@ -2988,14 +2988,31 @@ def _detect_gaze(frame_bgr):
                 continue
 
             # Find pupil: darkest region in the eye
-            # Apply Gaussian blur to reduce noise
-            eye_blur = cv2.GaussianBlur(eye_roi, (7, 7), 0)
+            # Apply heavy blur to reduce noise from eyelashes, reflections
+            eye_blur = cv2.GaussianBlur(eye_roi, (11, 11), 0)
 
-            # Threshold to find the darkest area (pupil/iris)
-            min_val, _, min_loc, _ = cv2.minMaxLoc(eye_blur)
+            # Check if the eye region has enough contrast to detect pupil
+            min_val, max_val, min_loc, _ = cv2.minMaxLoc(eye_blur)
+            contrast = max_val - min_val
 
-            # min_loc is (x, y) of the darkest point = pupil center
-            pupil_x, pupil_y = min_loc
+            # If contrast is too low, pupil detection is unreliable
+            # → assume center (benefit of the doubt)
+            if contrast < 30:
+                pupil_x = ew // 2
+                pupil_y = eh // 2
+            else:
+                # Use threshold to find dark blob (pupil/iris area)
+                threshold = min_val + contrast * 0.3
+                _, binary = cv2.threshold(eye_blur, int(threshold),
+                                          255, cv2.THRESH_BINARY_INV)
+
+                # Find centroid of the dark region (more stable than single pixel)
+                moments = cv2.moments(binary)
+                if moments["m00"] > 0:
+                    pupil_x = int(moments["m10"] / moments["m00"])
+                    pupil_y = int(moments["m01"] / moments["m00"])
+                else:
+                    pupil_x, pupil_y = min_loc  # fallback to darkest point
 
             # Normalize pupil position within the eye: -1 to 1
             # 0 = centered, -1 = far left/top, 1 = far right/bottom
@@ -3023,8 +3040,8 @@ def _detect_gaze(frame_bgr):
 
         # Classify gaze direction from pupil offset
         # Thresholds calibrated for typical webcam usage
-        x_thresh = 0.25   # how far off-center counts as "looking away"
-        y_thresh = 0.30
+        x_thresh = 0.45   # much wider center zone — natural eye movement is normal
+        y_thresh = 0.45
 
         if abs(avg_x) <= x_thresh and abs(avg_y) <= y_thresh:
             result["gaze_direction"] = "center"
@@ -3089,16 +3106,16 @@ async def exam_detect_with_gaze(file: UploadFile = File(...)):
         bx, by, bw, bh = emotion_result["bbox"]
         cx = (bx + bw / 2) / frame_w
         cy = (by + bh / 2) / frame_h
-        tol = 0.25
+        tol = 0.35
         if (0.5 - tol) <= cx <= (0.5 + tol) and (0.5 - tol) <= cy <= (0.5 + tol):
             head_region = "center"
-        elif cx < 0.35:
+        elif cx < 0.2:
             head_region = "left"
-        elif cx > 0.65:
+        elif cx > 0.8:
             head_region = "right"
-        elif cy < 0.35:
+        elif cy < 0.2:
             head_region = "top"
-        elif cy > 0.65:
+        elif cy > 0.8:
             head_region = "bottom"
         else:
             head_region = "center"

@@ -2536,7 +2536,7 @@ GAZE_REGIONS = {
 }
 
 FOCUS_THRESHOLDS = {
-    "center_tolerance"       : 0.35,    # 35% of frame from center = still "center"
+    "center_tolerance"       : 0.30,    # 30% of frame from center = still "center"
     "absence_warning_sec"    : 5,       # 5s away = warning
     "absence_critical_sec"   : 15,      # 15s away = critical flag
     "interaction_gap_warning": 30,      # 30s no typing/clicking = warning
@@ -3040,8 +3040,8 @@ def _detect_gaze(frame_bgr):
 
         # Classify gaze direction from pupil offset
         # Thresholds calibrated for typical webcam usage
-        x_thresh = 0.45   # much wider center zone — natural eye movement is normal
-        y_thresh = 0.45
+        x_thresh = 0.35   # balanced — catches real glances, ignores small movements
+        y_thresh = 0.35
 
         if abs(avg_x) <= x_thresh and abs(avg_y) <= y_thresh:
             result["gaze_direction"] = "center"
@@ -3106,16 +3106,16 @@ async def exam_detect_with_gaze(file: UploadFile = File(...)):
         bx, by, bw, bh = emotion_result["bbox"]
         cx = (bx + bw / 2) / frame_w
         cy = (by + bh / 2) / frame_h
-        tol = 0.35
+        tol = 0.30
         if (0.5 - tol) <= cx <= (0.5 + tol) and (0.5 - tol) <= cy <= (0.5 + tol):
             head_region = "center"
-        elif cx < 0.2:
+        elif cx < 0.25:
             head_region = "left"
-        elif cx > 0.8:
+        elif cx > 0.75:
             head_region = "right"
-        elif cy < 0.2:
+        elif cy < 0.25:
             head_region = "top"
-        elif cy > 0.8:
+        elif cy > 0.75:
             head_region = "bottom"
         else:
             head_region = "center"

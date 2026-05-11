@@ -3146,3 +3146,66 @@ async def exam_interaction_analysis(payload: dict):
 # ══════════════════════════════════════════════════════════════════════════
 # END EXAM ATTENTION TRACKING
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# FACE CHECK VIA HF — Uses trpakov/vit-face-expression on HF Inference API.
+# Same architecture as Whisper/RoBERTa — backend forwards image to HF cloud.
+# If HF returns emotion labels → face present. If error → face absent.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+_FACE_CHECK_URL = ("https://router.huggingface.co/hf-inference/"
+                   "models/trpakov/vit-face-expression")
+
+_VIT_LABEL_MAP = {
+    "angry": "anger", "disgust": "disgust", "fear": "fear",
+    "happy": "happiness", "neutral": "neutral",
+    "sad": "sadness", "surprise": "surprise",
+}
+
+
+@app.post("/api/face-check")
+async def face_check_hf(file: UploadFile = File(...)):
+    """
+    Quick face presence + emotion check via HF Inference API.
+    Sends image to trpakov/vit-face-expression (ViT on FER2013).
+    If model returns emotions → face is present.
+    If model fails → face not detected.
+    Used by exam proctoring for reliable face tracking.
+    """
+    img_bytes = await file.read()
+    if not img_bytes:
+        return {"face_detected": False, "error": "Empty image"}
+
+    try:
+        resp = _requests.post(
+            _FACE_CHECK_URL,
+            headers={**_HF_HEADERS, "Content-Type": "application/octet-stream"},
+            data=img_bytes,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response: [{"label": "happy", "score": 0.95}, ...]
+            if isinstance(data, list) and len(data) > 0:
+                # Map labels to our scheme
+                mapped = {}
+                for item in data:
+                    label = item.get("label", "").lower()
+                    our_label = _VIT_LABEL_MAP.get(label, label)
+                    mapped[our_label] = round(item.get("score", 0), 4)
+                dominant = max(mapped, key=mapped.get)
+                return {
+                    "face_detected": True,
+                    "dominant"     : dominant,
+                    "confidence"   : mapped.get(dominant, 0),
+                    "scores"       : mapped,
+                }
+        return {"face_detected": False, "error": f"HF {resp.status_code}"}
+    except Exception as e:
+        return {"face_detected": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END FACE CHECK VIA HF
+# ══════════════════════════════════════════════════════════════════════════

@@ -1311,3 +1311,199 @@ async def mark_all_read(
         n.is_read = True
     await db.commit()
     return {"success": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ADMIN — System management endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/users")
+async def admin_get_users(
+        role: Optional[str] = None,
+        admin: User = Depends(get_current_admin),
+        db: AsyncSession = Depends(get_db)):
+    """List all users with optional role filter."""
+    q = select(User)
+    if role:
+        q = q.where(User.role == role)
+    result = await db.execute(q.order_by(desc(User.created_at)))
+    users = result.scalars().all()
+    out = []
+    for u in users:
+        sess_res = await db.execute(
+            select(func.count(Session.id)).where(Session.user_id == u.id))
+        sess_count = sess_res.scalar() or 0
+        out.append({
+            "id": u.id, "name": u.name, "email": u.email,
+            "role": u.role, "is_active": u.is_active,
+            "sessions": sess_count,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        })
+    return {"users": out, "total": len(out)}
+
+
+class RoleUpdate(BaseModel):
+    role: str  # student, teacher, admin
+
+
+@router.put("/admin/users/{user_id}/role")
+async def admin_change_role(
+        user_id: int, data: RoleUpdate,
+        admin: User = Depends(get_current_admin),
+        db: AsyncSession = Depends(get_db)):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if data.role not in ("student", "teacher", "admin"):
+        raise HTTPException(400, "Invalid role")
+    user.role = data.role
+    await db.commit()
+    return {"success": True, "message": f"{user.name} is now {data.role}"}
+
+
+@router.put("/admin/users/{user_id}/status")
+async def admin_toggle_status(
+        user_id: int,
+        admin: User = Depends(get_current_admin),
+        db: AsyncSession = Depends(get_db)):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    user.is_active = not user.is_active
+    await db.commit()
+    return {"success": True, "is_active": user.is_active,
+            "message": f"{user.name} {'activated' if user.is_active else 'deactivated'}"}
+
+
+@router.get("/admin/stats")
+async def admin_platform_stats(
+        admin: User = Depends(get_current_admin),
+        db: AsyncSession = Depends(get_db)):
+    """Platform-wide analytics."""
+    total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
+    total_students = (await db.execute(
+        select(func.count(User.id)).where(User.role == "student"))).scalar() or 0
+    total_teachers = (await db.execute(
+        select(func.count(User.id)).where(User.role == "teacher"))).scalar() or 0
+    total_courses = (await db.execute(select(func.count(Course.id)))).scalar() or 0
+    total_sessions = (await db.execute(select(func.count(Session.id)))).scalar() or 0
+    total_exams = (await db.execute(select(func.count(Exam.id)))).scalar() or 0
+    total_submissions = (await db.execute(
+        select(func.count(ExamSubmission.id)))).scalar() or 0
+    total_enrollments = (await db.execute(
+        select(func.count(Enrollment.id)))).scalar() or 0
+
+    # Avg engagement across all sessions
+    avg_eng = (await db.execute(
+        select(func.avg(Session.avg_engagement)))).scalar() or 0
+
+    # Avg exam score + focus
+    avg_exam_score = (await db.execute(
+        select(func.avg(ExamSubmission.score)))).scalar() or 0
+    avg_focus = (await db.execute(
+        select(func.avg(ExamSubmission.focus_score)))).scalar() or 0
+
+    # Recent submissions
+    recent_subs = await db.execute(
+        select(ExamSubmission, User.name.label("sname"), Exam.title.label("etitle"))
+        .join(User, ExamSubmission.student_id == User.id)
+        .join(Exam, ExamSubmission.exam_id == Exam.id)
+        .order_by(desc(ExamSubmission.submitted_at)).limit(10))
+
+    return {
+        "users": {"total": total_users, "students": total_students,
+                  "teachers": total_teachers},
+        "courses": total_courses,
+        "enrollments": total_enrollments,
+        "sessions": total_sessions,
+        "avg_engagement": round(avg_eng * 100, 1) if avg_eng and avg_eng < 1 else round(avg_eng or 0, 1),
+        "exams": {"total": total_exams, "submissions": total_submissions,
+                  "avg_score": round(avg_exam_score or 0, 1),
+                  "avg_focus": round(avg_focus or 0, 1)},
+        "recent_submissions": [{
+            "student": r.sname, "exam": r.etitle,
+            "score": r.ExamSubmission.score,
+            "focus": r.ExamSubmission.focus_score,
+            "submitted": r.ExamSubmission.submitted_at.isoformat()
+                         if r.ExamSubmission.submitted_at else None,
+        } for r in recent_subs.all()],
+    }
+
+
+@router.get("/admin/health")
+async def admin_system_health(admin: User = Depends(get_current_admin)):
+    """Check health of all external services."""
+    import httpx
+    health = {}
+    hf_token = os.environ.get("HF_TOKEN", "")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    models = {
+        "EfficientNet-B2": None,  # local model, always OK if server is up
+        "Whisper (HF)": "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3",
+        "RoBERTa (HF)": "https://router.huggingface.co/hf-inference/models/j-hartmann/emotion-english-distilroberta-base",
+        "wav2vec2 (HF)": "https://router.huggingface.co/hf-inference/models/r-f/wav2vec-english-speech-emotion-recognition",
+        "VIT Face (HF)": "https://router.huggingface.co/hf-inference/models/trpakov/vit-face-expression",
+    }
+
+    health["EfficientNet-B2"] = {"status": "online", "type": "local"}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for name, url in models.items():
+            if url is None:
+                continue
+            try:
+                resp = await client.get(url, headers=headers)
+                health[name] = {
+                    "status": "online" if resp.status_code < 500 else "error",
+                    "code": resp.status_code, "type": "huggingface",
+                }
+            except Exception as e:
+                health[name] = {"status": "offline", "error": str(e), "type": "huggingface"}
+
+    # Database check
+    try:
+        await db_check()
+        health["PostgreSQL"] = {"status": "online", "type": "database"}
+    except Exception:
+        health["PostgreSQL"] = {"status": "error", "type": "database"}
+
+    all_online = all(v["status"] == "online" for v in health.values())
+    return {"overall": "healthy" if all_online else "degraded", "services": health}
+
+
+async def db_check():
+    from models_db import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        await db.execute(select(func.count(User.id)))
+
+
+@router.get("/admin/exam-integrity")
+async def admin_exam_integrity(
+        threshold: float = 50.0,
+        admin: User = Depends(get_current_admin),
+        db: AsyncSession = Depends(get_db)):
+    """Flag exam submissions with focus score below threshold."""
+    result = await db.execute(
+        select(ExamSubmission, User.name.label("sname"),
+               User.email.label("semail"), Exam.title.label("etitle"))
+        .join(User, ExamSubmission.student_id == User.id)
+        .join(Exam, ExamSubmission.exam_id == Exam.id)
+        .where(ExamSubmission.focus_score < threshold)
+        .order_by(ExamSubmission.focus_score))
+
+    flagged = []
+    for r in result.all():
+        flagged.append({
+            "submission_id": r.ExamSubmission.id,
+            "student": r.sname, "email": r.semail,
+            "exam": r.etitle,
+            "score": r.ExamSubmission.score,
+            "focus_score": r.ExamSubmission.focus_score,
+            "alerts_count": len(r.ExamSubmission.alerts or []),
+            "gap_warnings": len(r.ExamSubmission.gap_warnings or []),
+            "submitted": r.ExamSubmission.submitted_at.isoformat()
+                         if r.ExamSubmission.submitted_at else None,
+        })
+    return {"threshold": threshold, "flagged_count": len(flagged),
+            "flagged": flagged}

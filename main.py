@@ -138,6 +138,22 @@ app.include_router(api_router)
 @app.on_event("startup")
 async def startup():
     await init_db()
+    # Promote admin accounts
+    from models_db import AsyncSessionLocal, User
+    from sqlalchemy import select
+    admin_emails = [
+        "mohammad.shafizadeh@std.medipol.edu.tr",
+        "arya.ghazi@std.medipol.edu.tr",
+        "helya.ghazi.edu.tr",
+    ]
+    async with AsyncSessionLocal() as db:
+        for email in admin_emails:
+            result = await db.execute(select(User).where(User.email == email))
+            user = result.scalar_one_or_none()
+            if user and user.role != "admin":
+                user.role = "admin"
+                print(f"✅ Promoted {email} to admin")
+        await db.commit()
 
 # ── Static files ───────────────────────────────────────────────────────────
 static_path = Path(__file__).parent / "static"

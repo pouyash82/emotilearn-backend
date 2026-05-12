@@ -3209,3 +3209,43 @@ async def face_check_hf(file: UploadFile = File(...)):
 # ══════════════════════════════════════════════════════════════════════════
 # END FACE CHECK VIA HF
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# EXAM VIDEO STORAGE — In-memory for demo. Production: use S3/cloud.
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+_exam_videos = {}   # {submission_id: bytes}
+
+from fastapi.responses import Response as RawResponse
+
+@app.post("/api/exam/video/{submission_id}")
+async def upload_exam_video(submission_id: int, file: UploadFile = File(...)):
+    """Upload recorded exam video for a submission."""
+    data = await file.read()
+    if len(data) > 100 * 1024 * 1024:  # 100MB limit
+        return {"success": False, "error": "Video too large (max 100MB)"}
+    _exam_videos[submission_id] = data
+    return {"success": True, "size_mb": round(len(data) / 1024 / 1024, 1)}
+
+
+@app.get("/api/exam/video/{submission_id}")
+async def download_exam_video(submission_id: int):
+    """Download recorded exam video."""
+    if submission_id not in _exam_videos:
+        raise HTTPException(404, "Video not found")
+    return RawResponse(
+        content=_exam_videos[submission_id],
+        media_type="video/webm",
+        headers={"Content-Disposition": f"attachment; filename=exam_{submission_id}.webm"})
+
+
+@app.get("/api/exam/video/{submission_id}/exists")
+async def check_exam_video(submission_id: int):
+    """Check if video exists for a submission."""
+    return {"exists": submission_id in _exam_videos}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END EXAM VIDEO STORAGE
+# ══════════════════════════════════════════════════════════════════════════

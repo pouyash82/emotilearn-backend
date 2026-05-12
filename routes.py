@@ -7,7 +7,8 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from models_db import (
-    User, Course, Lecture, Session, EmotionLog, get_db)
+    User, Course, Lecture, Session, EmotionLog,
+    Enrollment, Exam, ExamSubmission, Notification, get_db)
 from auth import (
     hash_password, verify_password, create_token,
     get_current_user, get_current_teacher, get_current_admin)
@@ -813,3 +814,500 @@ async def admin_stats(
         "total_sessions": sessions.scalar(),
         "total_logs"    : logs.scalar(),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ENROLLMENT — Students enroll in courses
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.post("/courses/{course_id}/enroll")
+async def enroll_in_course(
+        course_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Student enrolls in a course."""
+    course = await db.get(Course, course_id)
+    if not course:
+        raise HTTPException(404, "Course not found")
+    existing = await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == user.id,
+            Enrollment.course_id == course_id))
+    if existing.scalar_one_or_none():
+        raise HTTPException(400, "Already enrolled")
+    enrollment = Enrollment(student_id=user.id, course_id=course_id)
+    db.add(enrollment)
+    await db.commit()
+    return {"success": True, "message": f"Enrolled in {course.name}"}
+
+
+@router.delete("/courses/{course_id}/enroll")
+async def unenroll_from_course(
+        course_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    enrollment = await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == user.id,
+            Enrollment.course_id == course_id))
+    e = enrollment.scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "Not enrolled")
+    await db.delete(e)
+    await db.commit()
+    return {"success": True}
+
+
+@router.get("/students/courses")
+async def student_get_courses(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Get courses the student is enrolled in."""
+    result = await db.execute(
+        select(Enrollment, Course)
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(Enrollment.student_id == user.id))
+    rows = result.all()
+    courses = []
+    for enrollment, course in rows:
+        teacher = await db.get(User, course.teacher_id)
+        courses.append({
+            "id": course.id,
+            "name": course.name,
+            "description": course.description,
+            "teacher_name": teacher.name if teacher else "Unknown",
+            "enrolled_at": enrollment.enrolled_at.isoformat()
+                           if enrollment.enrolled_at else None,
+        })
+    return {"courses": courses}
+
+
+@router.get("/courses/{course_id}/students")
+async def get_course_students(
+        course_id: int,
+        user: User = Depends(get_current_teacher),
+        db: AsyncSession = Depends(get_db)):
+    """Teacher gets enrolled students for a course."""
+    result = await db.execute(
+        select(Enrollment, User)
+        .join(User, Enrollment.student_id == User.id)
+        .where(Enrollment.course_id == course_id))
+    return {"students": [
+        {"id": u.id, "name": u.name, "email": u.email,
+         "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None}
+        for e, u in result.all()
+    ]}
+
+
+@router.get("/courses/available")
+async def get_available_courses(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """List all courses (for enrollment page)."""
+    result = await db.execute(select(Course))
+    courses = result.scalars().all()
+    # Check which ones student is enrolled in
+    enrolled = await db.execute(
+        select(Enrollment.course_id).where(
+            Enrollment.student_id == user.id))
+    enrolled_ids = {r[0] for r in enrolled.all()}
+    out = []
+    for c in courses:
+        teacher = await db.get(User, c.teacher_id)
+        out.append({
+            "id": c.id, "name": c.name,
+            "description": c.description,
+            "teacher_name": teacher.name if teacher else "Unknown",
+            "enrolled": c.id in enrolled_ids,
+        })
+    return {"courses": out}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# EXAMS — Teacher creates, student takes
+# ══════════════════════════════════════════════════════════════════════════
+
+class ExamCreate(BaseModel):
+    course_id  : int
+    title      : str
+    description: str = ""
+    questions  : list       # [{q, o, a}, ...]
+    time_limit : int = 600  # seconds
+    is_proctored: bool = True
+    due_date   : Optional[str] = None
+
+
+@router.post("/exams")
+async def create_exam(
+        data: ExamCreate,
+        user: User = Depends(get_current_teacher),
+        db: AsyncSession = Depends(get_db)):
+    """Teacher creates an exam for a course."""
+    course = await db.get(Course, data.course_id)
+    if not course or course.teacher_id != user.id:
+        raise HTTPException(403, "Not your course")
+    due = None
+    if data.due_date:
+        try:
+            due = datetime.fromisoformat(
+                data.due_date.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+    exam = Exam(
+        course_id=data.course_id, title=data.title,
+        description=data.description, questions=data.questions,
+        time_limit=data.time_limit, is_proctored=data.is_proctored,
+        due_date=due, created_by=user.id)
+    db.add(exam)
+    await db.flush()
+    # Notify all enrolled students
+    enrollments = await db.execute(
+        select(Enrollment.student_id).where(
+            Enrollment.course_id == data.course_id))
+    for (sid,) in enrollments.all():
+        db.add(Notification(
+            user_id=sid, type="exam",
+            title=f"New Exam: {data.title}",
+            message=f"A new exam has been posted for {course.name}.",
+            link=f"/exam?id={exam.id}"))
+    await db.commit()
+    await db.refresh(exam)
+    return {"success": True, "exam_id": exam.id,
+            "message": f"Exam '{data.title}' created, "
+                       f"{enrollments.rowcount if hasattr(enrollments, 'rowcount') else 'all'} students notified"}
+
+
+@router.get("/courses/{course_id}/exams")
+async def get_course_exams(
+        course_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """List exams for a course (works for both student and teacher)."""
+    result = await db.execute(
+        select(Exam).where(Exam.course_id == course_id)
+        .order_by(desc(Exam.created_at)))
+    exams = result.scalars().all()
+    out = []
+    for e in exams:
+        # Check if student has submitted
+        sub = None
+        if user.role == "student":
+            sub_res = await db.execute(
+                select(ExamSubmission).where(
+                    ExamSubmission.exam_id == e.id,
+                    ExamSubmission.student_id == user.id))
+            sub_obj = sub_res.scalar_one_or_none()
+            if sub_obj:
+                sub = {"score": sub_obj.score,
+                       "focus_score": sub_obj.focus_score,
+                       "submitted_at": sub_obj.submitted_at.isoformat()
+                                       if sub_obj.submitted_at else None}
+        out.append({
+            "id": e.id, "title": e.title,
+            "description": e.description,
+            "question_count": len(e.questions) if e.questions else 0,
+            "time_limit": e.time_limit,
+            "is_proctored": e.is_proctored,
+            "due_date": e.due_date.isoformat() if e.due_date else None,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "submission": sub,
+        })
+    return {"exams": out}
+
+
+@router.get("/exams/{exam_id}")
+async def get_exam(
+        exam_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Load exam for taking (student) or reviewing (teacher).
+    For students: questions without correct answers.
+    For teachers: full questions with answers."""
+    exam = await db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Exam not found")
+    course = await db.get(Course, exam.course_id)
+    # Strip answers for students
+    qs = exam.questions or []
+    if user.role == "student":
+        qs = [{"q": q["q"], "o": q["o"]} for q in qs]
+    return {
+        "id": exam.id, "title": exam.title,
+        "description": exam.description,
+        "course_name": course.name if course else "",
+        "questions": qs,
+        "time_limit": exam.time_limit,
+        "is_proctored": exam.is_proctored,
+        "due_date": exam.due_date.isoformat() if exam.due_date else None,
+    }
+
+
+@router.delete("/exams/{exam_id}")
+async def delete_exam(
+        exam_id: int,
+        user: User = Depends(get_current_teacher),
+        db: AsyncSession = Depends(get_db)):
+    exam = await db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Exam not found")
+    course = await db.get(Course, exam.course_id)
+    if not course or course.teacher_id != user.id:
+        raise HTTPException(403, "Not your exam")
+    await db.delete(exam)
+    await db.commit()
+    return {"success": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# EXAM SUBMISSIONS — Student submits, teacher reviews
+# ══════════════════════════════════════════════════════════════════════════
+
+class SubmitExam(BaseModel):
+    exam_id       : int
+    answers       : dict           # {0: 1, 1: 2, ...}
+    focus_score   : float = 100
+    focus_log     : list = []
+    alerts        : list = []
+    answer_timing : dict = {}
+    gap_warnings  : list = []
+    duration_sec  : int = 0
+
+
+@router.post("/exams/submit")
+async def submit_exam(
+        data: SubmitExam,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Student submits exam answers + focus data."""
+    exam = await db.get(Exam, data.exam_id)
+    if not exam:
+        raise HTTPException(404, "Exam not found")
+    # Check if already submitted
+    existing = await db.execute(
+        select(ExamSubmission).where(
+            ExamSubmission.exam_id == data.exam_id,
+            ExamSubmission.student_id == user.id))
+    if existing.scalar_one_or_none():
+        raise HTTPException(400, "Already submitted")
+    # Calculate score
+    qs = exam.questions or []
+    correct = 0
+    for idx_str, ans in data.answers.items():
+        idx = int(idx_str)
+        if 0 <= idx < len(qs) and ans == qs[idx].get("a"):
+            correct += 1
+    score = round(correct / max(1, len(qs)) * 100, 1)
+    sub = ExamSubmission(
+        exam_id=data.exam_id, student_id=user.id,
+        answers=data.answers, score=score,
+        total_correct=correct, total_questions=len(qs),
+        focus_score=data.focus_score, focus_log=data.focus_log,
+        alerts=data.alerts, answer_timing=data.answer_timing,
+        gap_warnings=data.gap_warnings, duration_sec=data.duration_sec)
+    db.add(sub)
+    await db.commit()
+    await db.refresh(sub)
+    return {
+        "success": True, "submission_id": sub.id,
+        "score": score, "correct": correct, "total": len(qs),
+        "focus_score": data.focus_score,
+    }
+
+
+@router.get("/students/exams")
+async def student_get_exams(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Student gets all pending + completed exams across enrolled courses."""
+    enrolled = await db.execute(
+        select(Enrollment.course_id).where(
+            Enrollment.student_id == user.id))
+    course_ids = [r[0] for r in enrolled.all()]
+    if not course_ids:
+        return {"exams": []}
+    result = await db.execute(
+        select(Exam, Course.name.label("course_name"))
+        .join(Course, Exam.course_id == Course.id)
+        .where(Exam.course_id.in_(course_ids))
+        .order_by(desc(Exam.created_at)))
+    exams = []
+    for exam, course_name in result.all():
+        sub_res = await db.execute(
+            select(ExamSubmission).where(
+                ExamSubmission.exam_id == exam.id,
+                ExamSubmission.student_id == user.id))
+        sub = sub_res.scalar_one_or_none()
+        exams.append({
+            "id": exam.id, "title": exam.title,
+            "course_name": course_name,
+            "course_id": exam.course_id,
+            "question_count": len(exam.questions) if exam.questions else 0,
+            "time_limit": exam.time_limit,
+            "is_proctored": exam.is_proctored,
+            "due_date": exam.due_date.isoformat() if exam.due_date else None,
+            "submitted": sub is not None,
+            "score": sub.score if sub else None,
+            "focus_score": sub.focus_score if sub else None,
+            "submitted_at": sub.submitted_at.isoformat()
+                           if sub and sub.submitted_at else None,
+        })
+    return {"exams": exams}
+
+
+@router.get("/students/submissions/{submission_id}")
+async def student_get_submission(
+        submission_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    """Student views their own submission details."""
+    sub = await db.get(ExamSubmission, submission_id)
+    if not sub or sub.student_id != user.id:
+        raise HTTPException(404, "Submission not found")
+    exam = await db.get(Exam, sub.exam_id)
+    return {
+        "submission": {
+            "id": sub.id, "score": sub.score,
+            "total_correct": sub.total_correct,
+            "total_questions": sub.total_questions,
+            "focus_score": sub.focus_score,
+            "focus_log": sub.focus_log,
+            "alerts": sub.alerts,
+            "answer_timing": sub.answer_timing,
+            "gap_warnings": sub.gap_warnings,
+            "duration_sec": sub.duration_sec,
+            "submitted_at": sub.submitted_at.isoformat()
+                           if sub.submitted_at else None,
+        },
+        "exam": {
+            "title": exam.title if exam else "",
+            "questions": exam.questions if exam else [],
+        },
+        "answers": sub.answers,
+    }
+
+
+@router.get("/exams/{exam_id}/submissions")
+async def teacher_get_submissions(
+        exam_id: int,
+        user: User = Depends(get_current_teacher),
+        db: AsyncSession = Depends(get_db)):
+    """Teacher views all submissions for an exam."""
+    exam = await db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Exam not found")
+    result = await db.execute(
+        select(ExamSubmission, User.name.label("student_name"),
+               User.email.label("student_email"))
+        .join(User, ExamSubmission.student_id == User.id)
+        .where(ExamSubmission.exam_id == exam_id)
+        .order_by(desc(ExamSubmission.submitted_at)))
+    submissions = []
+    for sub, sname, semail in result.all():
+        submissions.append({
+            "id": sub.id, "student_name": sname,
+            "student_email": semail,
+            "score": sub.score, "focus_score": sub.focus_score,
+            "alerts_count": len(sub.alerts) if sub.alerts else 0,
+            "gap_warnings_count": len(sub.gap_warnings)
+                                 if sub.gap_warnings else 0,
+            "duration_sec": sub.duration_sec,
+            "submitted_at": sub.submitted_at.isoformat()
+                           if sub.submitted_at else None,
+        })
+    avg_score = (round(sum(s["score"] for s in submissions)
+                       / len(submissions), 1)
+                 if submissions else 0)
+    avg_focus = (round(sum(s["focus_score"] for s in submissions)
+                       / len(submissions), 1)
+                 if submissions else 0)
+    return {
+        "exam_title": exam.title,
+        "total_submissions": len(submissions),
+        "avg_score": avg_score, "avg_focus": avg_focus,
+        "submissions": submissions,
+    }
+
+
+@router.get("/teacher/submissions/{submission_id}")
+async def teacher_view_submission(
+        submission_id: int,
+        user: User = Depends(get_current_teacher),
+        db: AsyncSession = Depends(get_db)):
+    """Teacher views full submission detail including focus report."""
+    sub = await db.get(ExamSubmission, submission_id)
+    if not sub:
+        raise HTTPException(404, "Submission not found")
+    exam = await db.get(Exam, sub.exam_id)
+    student = await db.get(User, sub.student_id)
+    return {
+        "student": {"name": student.name if student else "",
+                    "email": student.email if student else ""},
+        "exam": {"title": exam.title if exam else "",
+                 "questions": exam.questions if exam else []},
+        "submission": {
+            "answers": sub.answers, "score": sub.score,
+            "total_correct": sub.total_correct,
+            "total_questions": sub.total_questions,
+            "focus_score": sub.focus_score,
+            "focus_log": sub.focus_log,
+            "alerts": sub.alerts,
+            "answer_timing": sub.answer_timing,
+            "gap_warnings": sub.gap_warnings,
+            "duration_sec": sub.duration_sec,
+            "submitted_at": sub.submitted_at.isoformat()
+                           if sub.submitted_at else None,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NOTIFICATIONS
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.get("/notifications")
+async def get_notifications(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Notification)
+        .where(Notification.user_id == user.id)
+        .order_by(desc(Notification.created_at))
+        .limit(50))
+    notifs = result.scalars().all()
+    unread = sum(1 for n in notifs if not n.is_read)
+    return {
+        "unread": unread,
+        "notifications": [{
+            "id": n.id, "type": n.type, "title": n.title,
+            "message": n.message, "link": n.link,
+            "is_read": n.is_read,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        } for n in notifs],
+    }
+
+
+@router.post("/notifications/{notif_id}/read")
+async def mark_notification_read(
+        notif_id: int,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    notif = await db.get(Notification, notif_id)
+    if not notif or notif.user_id != user.id:
+        raise HTTPException(404, "Notification not found")
+    notif.is_read = True
+    await db.commit()
+    return {"success": True}
+
+
+@router.post("/notifications/read-all")
+async def mark_all_read(
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Notification).where(
+            Notification.user_id == user.id,
+            Notification.is_read == False))
+    for n in result.scalars().all():
+        n.is_read = True
+    await db.commit()
+    return {"success": True}

@@ -102,3 +102,68 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     print("✅ Database tables created")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW TABLES — Course enrollment, Exams, Submissions, Notifications
+# Appended below — nothing above was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+class Enrollment(Base):
+    __tablename__ = "enrollments"
+    id          = Column(Integer, primary_key=True, index=True)
+    student_id  = Column(Integer, ForeignKey("users.id"), nullable=False)
+    course_id   = Column(Integer, ForeignKey("courses.id"), nullable=False)
+    enrolled_at = Column(DateTime, default=datetime.utcnow)
+    student     = relationship("User")
+    course      = relationship("Course")
+
+
+class Exam(Base):
+    __tablename__ = "exams"
+    id          = Column(Integer, primary_key=True, index=True)
+    course_id   = Column(Integer, ForeignKey("courses.id"), nullable=False)
+    title       = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    questions   = Column(JSON, nullable=False)     # [{q, o, a}, ...]
+    time_limit  = Column(Integer, default=600)     # seconds
+    is_proctored= Column(Boolean, default=True)
+    due_date    = Column(DateTime, nullable=True)
+    created_by  = Column(Integer, ForeignKey("users.id"))
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    course      = relationship("Course")
+    creator     = relationship("User")
+    submissions = relationship("ExamSubmission", back_populates="exam")
+
+
+class ExamSubmission(Base):
+    __tablename__ = "exam_submissions"
+    id             = Column(Integer, primary_key=True, index=True)
+    exam_id        = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    student_id     = Column(Integer, ForeignKey("users.id"), nullable=False)
+    answers        = Column(JSON, default={})       # {0: 1, 1: 2, ...}
+    score          = Column(Float, default=0.0)     # percentage
+    total_correct  = Column(Integer, default=0)
+    total_questions= Column(Integer, default=0)
+    focus_score    = Column(Float, default=100.0)
+    focus_log      = Column(JSON, default=[])       # [{ts, s, d, c}, ...]
+    alerts         = Column(JSON, default=[])       # [{t, m}, ...]
+    answer_timing  = Column(JSON, default={})       # {0: 12, 1: 25, ...}
+    gap_warnings   = Column(JSON, default=[])       # [{q, gap, ts}, ...]
+    duration_sec   = Column(Integer, default=0)
+    submitted_at   = Column(DateTime, default=datetime.utcnow)
+    exam           = relationship("Exam", back_populates="submissions")
+    student        = relationship("User")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
+    type       = Column(String, default="exam")     # exam, course, system
+    title      = Column(String, nullable=False)
+    message    = Column(Text, nullable=True)
+    link       = Column(String, nullable=True)      # e.g. /exam?id=5
+    is_read    = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user       = relationship("User")

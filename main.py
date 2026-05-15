@@ -3265,3 +3265,205 @@ async def check_exam_video(submission_id: int):
 # ══════════════════════════════════════════════════════════════════════════
 # END EXAM VIDEO STORAGE
 # ══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# RTSP STREAM MANAGER — Background threads read CCTV cameras, process
+# frames through multi-face EfficientNet-B2 pipeline, store results.
+# For VPS/dedicated server deployment (not Railway free tier).
+# Nothing above this line was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+import threading
+from typing import Dict, Any
+
+class StreamManager:
+    """Manages multiple RTSP/camera streams with background processing."""
+
+    def __init__(self):
+        self.streams: Dict[str, dict] = {}   # stream_id → config + state
+        self.results: Dict[str, dict] = {}   # stream_id → latest results
+        self.threads: Dict[str, threading.Thread] = {}
+        self._lock = threading.Lock()
+
+    def add_stream(self, stream_id: str, source: str, name: str = "",
+                   interval: float = 3.0, classroom: str = ""):
+        if stream_id in self.streams:
+            return False
+        with self._lock:
+            self.streams[stream_id] = {
+                "source": source, "name": name or stream_id,
+                "interval": interval, "classroom": classroom,
+                "active": True, "status": "starting",
+                "frames_processed": 0, "last_error": None,
+            }
+            self.results[stream_id] = {
+                "faces": [], "count": 0, "class_engagement": 0,
+                "last_update": None,
+            }
+        thread = threading.Thread(
+            target=self._stream_loop, args=(stream_id,), daemon=True)
+        self.threads[stream_id] = thread
+        thread.start()
+        return True
+
+    def remove_stream(self, stream_id: str):
+        if stream_id not in self.streams:
+            return False
+        with self._lock:
+            self.streams[stream_id]["active"] = False
+        # Thread will stop on next iteration
+        return True
+
+    def get_all_status(self):
+        with self._lock:
+            return {sid: {
+                "name": cfg["name"], "classroom": cfg["classroom"],
+                "status": cfg["status"], "source": cfg["source"],
+                "frames": cfg["frames_processed"],
+                "interval": cfg["interval"],
+                "error": cfg["last_error"],
+            } for sid, cfg in self.streams.items()}
+
+    def get_results(self, stream_id: str):
+        return self.results.get(stream_id)
+
+    def get_all_results(self):
+        with self._lock:
+            return {sid: res.copy() for sid, res in self.results.items()}
+
+    def _stream_loop(self, stream_id: str):
+        """Background thread: read frames → process → store results."""
+        cfg = self.streams[stream_id]
+        source = cfg["source"]
+        interval = cfg["interval"]
+
+        # Try to parse source as integer (USB camera)
+        try:
+            source = int(source)
+        except (ValueError, TypeError):
+            pass
+
+        print(f"📹 Stream [{stream_id}] connecting to {source}")
+
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            cfg["status"] = "error"
+            cfg["last_error"] = f"Cannot open: {source}"
+            print(f"❌ Stream [{stream_id}] failed to open")
+            return
+
+        cfg["status"] = "running"
+        print(f"✅ Stream [{stream_id}] connected")
+
+        # Reset multi-face tracker for this stream
+        _multi_reset()
+
+        while cfg["active"]:
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    cfg["status"] = "reconnecting"
+                    cap.release()
+                    time.sleep(2)
+                    cap = cv2.VideoCapture(source)
+                    if not cap.isOpened():
+                        cfg["last_error"] = "Reconnect failed"
+                        time.sleep(5)
+                    continue
+
+                cfg["status"] = "running"
+                # Process through multi-face pipeline
+                _, face_results = _detect_and_predict_multi(frame)
+
+                # Compute class engagement
+                class_eng = 0
+                if face_results:
+                    class_eng = round(
+                        sum(f.get("engagement", 0) for f in face_results)
+                        / len(face_results), 1)
+
+                with self._lock:
+                    self.results[stream_id] = {
+                        "faces": face_results,
+                        "count": len(face_results),
+                        "class_engagement": class_eng,
+                        "last_update": datetime.now().isoformat(),
+                    }
+                    cfg["frames_processed"] += 1
+
+                time.sleep(interval)
+
+            except Exception as e:
+                cfg["last_error"] = str(e)
+                time.sleep(interval)
+
+        # Cleanup
+        cap.release()
+        cfg["status"] = "stopped"
+        print(f"⏹ Stream [{stream_id}] stopped")
+
+
+# Global stream manager instance
+_stream_mgr = StreamManager()
+
+
+class StreamConfig(BaseModel):
+    stream_id : str
+    source    : str            # rtsp://..., http://..., or camera index
+    name      : str = ""       # display name
+    interval  : float = 3.0    # seconds between frame captures
+    classroom : str = ""       # room name/number
+
+
+@app.post("/api/streams/add")
+async def add_stream(config: StreamConfig):
+    """Add a new RTSP/camera stream for continuous monitoring."""
+    ok = _stream_mgr.add_stream(
+        config.stream_id, config.source, config.name,
+        config.interval, config.classroom)
+    if not ok:
+        return {"success": False, "error": "Stream ID already exists"}
+    return {"success": True,
+            "message": f"Stream '{config.name or config.stream_id}' started"}
+
+
+@app.delete("/api/streams/{stream_id}")
+async def remove_stream(stream_id: str):
+    """Stop and remove a stream."""
+    ok = _stream_mgr.remove_stream(stream_id)
+    if not ok:
+        return {"success": False, "error": "Stream not found"}
+    return {"success": True}
+
+
+@app.get("/api/streams")
+async def list_streams():
+    """List all active streams with their status."""
+    return {"streams": _stream_mgr.get_all_status()}
+
+
+@app.get("/api/streams/{stream_id}/results")
+async def get_stream_results(stream_id: str):
+    """Get latest multi-face results for a specific stream."""
+    results = _stream_mgr.get_results(stream_id)
+    if not results:
+        return {"success": False, "error": "Stream not found"}
+    return {"success": True, **results}
+
+
+@app.get("/api/streams/results")
+async def get_all_stream_results():
+    """Get latest results from ALL active streams (campus-wide view)."""
+    return {"streams": _stream_mgr.get_all_results()}
+
+
+@app.get("/api/streams/{stream_id}/profile")
+async def get_stream_profile(stream_id: str):
+    """Get per-face engagement profile for a stream session."""
+    profile = _multi_profile()
+    return {"success": True, "stream_id": stream_id, **profile}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# END RTSP STREAM MANAGER
+# ══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # ── PostgreSQL Database ─────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: emotilearn
+      POSTGRES_USER: emotilearn
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-emotilearn_secure_2026}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U emotilearn"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── EmotiLearn Backend ──────────────────────────────────────────
+  backend:
+    build: .
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://emotilearn:${DB_PASSWORD:-emotilearn_secure_2026}@db:5432/emotilearn
+      HF_TOKEN: ${HF_TOKEN}
+      JWT_SECRET: ${JWT_SECRET:-emotilearn_jwt_secret_2026}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models        # Mount model files
+      - ./exam_videos:/app/videos   # Persistent video storage
+
+  # ── Nginx Reverse Proxy + SSL ───────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./certbot/conf:/etc/letsencrypt        # SSL certs
+      - ./certbot/www:/var/www/certbot
+
+volumes:
+  postgres_data:

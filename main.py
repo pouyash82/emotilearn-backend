@@ -162,6 +162,11 @@ if static_path.exists():
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://emotilearn-frontend.vercel.app",
+    ],
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],

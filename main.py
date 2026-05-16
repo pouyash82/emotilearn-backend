@@ -167,7 +167,6 @@ app.add_middleware(
         "http://localhost:5173",
         "https://emotilearn-frontend.vercel.app",
     ],
-    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

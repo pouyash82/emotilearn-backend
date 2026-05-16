@@ -167,3 +167,79 @@ class Notification(Base):
     is_read    = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     user       = relationship("User")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW TABLES — Admin features + Chat system
+# Appended below — nothing above was changed.
+# ══════════════════════════════════════════════════════════════════════════
+
+class AuditLog(Base):
+    """Tracks all significant actions for admin audit trail."""
+    __tablename__ = "audit_logs"
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action     = Column(String, nullable=False)       # login, logout, grade_change, user_create, etc.
+    target     = Column(String, nullable=True)         # what was acted on (user:5, course:3, etc.)
+    details    = Column(JSON, default={})              # extra context
+    ip_address = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user       = relationship("User")
+
+
+class ConsentRecord(Base):
+    """Tracks student consent for emotion tracking / data collection."""
+    __tablename__ = "consent_records"
+    id          = Column(Integer, primary_key=True, index=True)
+    student_id  = Column(Integer, ForeignKey("users.id"), nullable=False)
+    consent_type= Column(String, nullable=False)       # emotion_tracking, data_storage, video_recording
+    granted     = Column(Boolean, default=False)
+    granted_at  = Column(DateTime, nullable=True)
+    revoked_at  = Column(DateTime, nullable=True)
+    ip_address  = Column(String, nullable=True)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    student     = relationship("User")
+
+
+class Conversation(Base):
+    """A DM thread between two users (student↔teacher or teacher↔admin)."""
+    __tablename__ = "conversations"
+    id          = Column(Integer, primary_key=True, index=True)
+    user1_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user2_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
+    last_message= Column(Text, nullable=True)
+    last_at     = Column(DateTime, nullable=True)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    user1       = relationship("User", foreign_keys=[user1_id])
+    user2       = relationship("User", foreign_keys=[user2_id])
+    messages    = relationship("Message", back_populates="conversation",
+                               order_by="Message.created_at")
+
+
+class Message(Base):
+    """A single chat message within a conversation."""
+    __tablename__ = "messages"
+    id              = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"),
+                             nullable=False)
+    sender_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content         = Column(Text, nullable=False)
+    is_read         = Column(Boolean, default=False)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    conversation    = relationship("Conversation", back_populates="messages")
+    sender          = relationship("User")
+
+
+class SystemAnnouncement(Base):
+    """Admin broadcast messages visible to all users."""
+    __tablename__ = "system_announcements"
+    id         = Column(Integer, primary_key=True, index=True)
+    admin_id   = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title      = Column(String, nullable=False)
+    content    = Column(Text, nullable=False)
+    priority   = Column(String, default="normal")      # low, normal, high, critical
+    target_role= Column(String, nullable=True)          # null=all, student, teacher
+    is_active  = Column(Boolean, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    admin      = relationship("User")

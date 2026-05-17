@@ -151,21 +151,37 @@ app.include_router(api_router)
 @app.on_event("startup")
 async def startup():
     await init_db()
-    # Promote admin accounts
+    # Auto-create and promote admin accounts
     from models_db import AsyncSessionLocal, User
+    from auth import hash_password
     from sqlalchemy import select
-    admin_emails = [
-        "mohammad.shafizadeh@std.medipol.edu.tr",
-        "arya.ghazi@std.medipol.edu.tr",
-        "helya.ghazi.edu.tr",
+    admin_accounts = [
+        {"email": "mohammad.shafizadeh@std.medipol.edu.tr",
+         "name": "Mohammad Shafizadeh", "password": "EmotiAdmin2026!"},
+        {"email": "arya.ghazi@std.medipol.edu.tr",
+         "name": "Arya Ghazizadeh", "password": "EmotiAdmin2026!"},
+        {"email": "helya.ghazi@std.medipol.edu.tr",
+         "name": "Helya Ghazizadeh", "password": "EmotiAdmin2026!"},
     ]
     async with AsyncSessionLocal() as db:
-        for email in admin_emails:
-            result = await db.execute(select(User).where(User.email == email))
+        for acct in admin_accounts:
+            result = await db.execute(
+                select(User).where(User.email == acct["email"]))
             user = result.scalar_one_or_none()
-            if user and user.role != "admin":
+            if not user:
+                # Create the admin account
+                user = User(
+                    email=acct["email"],
+                    name=acct["name"],
+                    password_hash=hash_password(acct["password"]),
+                    role="admin",
+                    is_active=True,
+                )
+                db.add(user)
+                print(f"✅ Created admin: {acct['email']}")
+            elif user.role != "admin":
                 user.role = "admin"
-                print(f"✅ Promoted {email} to admin")
+                print(f"✅ Promoted {acct['email']} to admin")
         await db.commit()
 
 # ── Static files ───────────────────────────────────────────────────────────

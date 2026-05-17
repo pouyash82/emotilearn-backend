@@ -26,3 +26,5 @@ numba
 scipy
 requests
 loguru
+psutil
+httpx

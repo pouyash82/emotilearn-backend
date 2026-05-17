@@ -129,6 +129,19 @@ def get_learning_profile():
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Emotion Recognition API")
 
+# ── CORS — must be added before routes ─────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://emotilearn-frontend.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── DB integration ─────────────────────────────────────────────────────────
 from models_db import init_db
 from routes import router as api_router
@@ -159,18 +172,6 @@ async def startup():
 static_path = Path(__file__).parent / "static"
 if static_path.exists():
     app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://emotilearn-frontend.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── Vision model ───────────────────────────────────────────────────────────
 vision_model = None

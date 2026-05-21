@@ -2529,11 +2529,11 @@ async def start_conversation(
     other = await db.get(User, data.other_user_id)
     if not other:
         raise HTTPException(404, "User not found")
-    # Check role permissions (student↔teacher, teacher↔admin)
+    # Check role permissions (student↔teacher, teacher↔teacher, teacher↔admin)
     allowed = False
     if user.role == "student" and other.role == "teacher":
         allowed = True
-    elif user.role == "teacher" and other.role in ("student", "admin"):
+    elif user.role == "teacher" and other.role in ("student", "teacher", "admin"):
         allowed = True
     elif user.role == "admin":
         allowed = True
@@ -2663,7 +2663,7 @@ async def get_chat_contacts(
             contacts = [{"id": t.id, "name": t.name, "email": t.email,
                          "role": t.role} for t in teachers.scalars().all()]
     elif user.role == "teacher":
-        # Teachers can message their students + admins
+        # Teachers can message their students + other teachers + admins
         course_ids = await db.execute(
             select(Course.id).where(Course.teacher_id == user.id))
         cids = [r[0] for r in course_ids.all()]
@@ -2674,6 +2674,12 @@ async def get_chat_contacts(
                 .where(Enrollment.course_id.in_(cids)))
             contacts.extend([{"id": s.id, "name": s.name, "email": s.email,
                               "role": s.role} for s in stu_res.scalars().all()])
+        # Other teachers
+        teacher_res = await db.execute(
+            select(User).where(User.role == "teacher", User.id != user.id))
+        contacts.extend([{"id": t.id, "name": t.name, "email": t.email,
+                          "role": t.role} for t in teacher_res.scalars().all()])
+        # Admins
         admin_res = await db.execute(
             select(User).where(User.role == "admin"))
         contacts.extend([{"id": a.id, "name": a.name, "email": a.email,
